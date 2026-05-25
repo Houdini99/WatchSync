@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark" />
+  <title>WatchSync</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="landing" class="landing">
+    <div class="landing-card">
+      <h1>WatchSync</h1>
+      <p class="tagline">Watch together, perfectly in sync.</p>
+      <button id="create-room" class="btn-primary">Create a Room</button>
+      <p class="hint">No signup. Share the URL to invite friends.</p>
+    </div>
+  </div>
+
+  <div id="nickname-modal" class="modal hidden">
+    <div class="modal-card">
+      <h2>Pick a nickname</h2>
+      <input id="nickname-input" type="text" maxlength="24" placeholder="Your name" autocomplete="off" />
+      <button id="nickname-join" class="btn-primary">Join Room</button>
+    </div>
+  </div>
+
+  <main id="room" class="room hidden">
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="brand">WatchSync</div>
+        <div id="video-title" class="video-title" title=""></div>
+      </div>
+      <div class="topbar-controls">
+        <span id="ping-indicator" class="ping" title="Round-trip latency">…</span>
+        <button id="resync-btn" class="btn-icon" title="Resync to room">⟳</button>
+        <button id="sound-toggle" class="btn-icon" title="Toggle chat sound">🔔</button>
+        <button id="fullscreen-btn" class="btn-icon" title="Fullscreen (F)">⛶</button>
+        <button id="copy-link" class="btn-ghost" title="Copy invite link">Copy link</button>
+        <label class="lock-toggle hidden" id="lock-wrap">
+          <input type="checkbox" id="lock-toggle" /> <span>Lock</span>
+        </label>
+        <label class="lock-toggle hidden" id="persist-wrap">
+          <input type="checkbox" id="persist-toggle" /> <span>Persist</span>
+        </label>
+      </div>
+    </header>
+
+    <section class="player-wrap">
+      <div id="player-mount" class="player-mount">
+        <div id="player-placeholder" class="placeholder">
+          <p>Paste a YouTube or direct video URL below to begin.</p>
+        </div>
+        <video id="html5-video" class="hidden" controls playsinline></video>
+        <div id="yt-mount" class="hidden"></div>
+      </div>
+      <form id="url-form" class="url-form">
+        <input id="url-input" type="url" placeholder="https://youtube.com/watch?v=... or https://example.com/video.mp4" />
+        <button type="submit" class="btn-primary">Load</button>
+        <button type="button" id="queue-add" class="btn-ghost">+ Queue</button>
+      </form>
+      <div id="media-warning" class="media-warning hidden"></div>
+      <div id="status-line" class="status-line"></div>
+    </section>
+
+    <aside class="sidebar">
+      <div class="tabs">
+        <button class="tab active" data-tab="chat">Chat <span id="unread-badge" class="badge unread hidden">0</span></button>
+        <button class="tab" data-tab="queue">Queue <span id="queue-count" class="badge">0</span></button>
+        <button class="tab" data-tab="users">Users <span id="user-count" class="badge">0</span></button>
+      </div>
+
+      <div class="tab-panel active" data-tab-panel="chat">
+        <div id="chat-log" class="chat-log"></div>
+        <div class="reactions">
+          <button class="react-btn" data-emoji="👍">👍</button>
+          <button class="react-btn" data-emoji="❤️">❤️</button>
+          <button class="react-btn" data-emoji="😂">😂</button>
+          <button class="react-btn" data-emoji="🔥">🔥</button>
+          <button class="react-btn" data-emoji="👀">👀</button>
+          <button class="react-btn" data-emoji="🎉">🎉</button>
+        </div>
+        <form id="chat-form" class="chat-form">
+          <input id="chat-input" type="text" maxlength="500" placeholder="Say something…" autocomplete="off" />
+          <button type="submit" class="btn-primary">Send</button>
+        </form>
+      </div>
+
+      <div class="tab-panel" data-tab-panel="queue">
+        <ul id="queue-list" class="queue-list"></ul>
+        <button id="queue-skip" class="btn-ghost full">Skip to next</button>
+      </div>
+
+      <div class="tab-panel" data-tab-panel="users">
+        <ul id="user-list" class="user-list"></ul>
+      </div>
+    </aside>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/lib/hls.min.js"></script>
+  <script src="/lib/purify.min.js"></script>
+  <script src="https://www.youtube.com/iframe_api"></script>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

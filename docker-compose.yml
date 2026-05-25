@@ -1,0 +1,33 @@
+services:
+  watchsync-server:
+    image: watchsync-server:latest
+    pull_policy: never
+    container_name: watchsync-server
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - HOST=0.0.0.0
+      - CORS_ORIGIN=${PUBLIC_ORIGIN:-*}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    networks:
+      - proxy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  watchsync-client:
+    image: watchsync-client:latest
+    pull_policy: never
+    container_name: watchsync-client
+    restart: unless-stopped
+    depends_on:
+      - watchsync-server
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
