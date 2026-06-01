@@ -8,8 +8,16 @@ services:
       - NODE_ENV=production
       - PORT=3000
       - HOST=0.0.0.0
+      # Lock this to your public https origin in production. "*" reflects any
+      # origin (fine for testing). Comma-separate to allow several.
       - CORS_ORIGIN=${PUBLIC_ORIGIN:-*}
       - LOG_LEVEL=${LOG_LEVEL:-info}
+      # Optional tunables (defaults shown in server/src/config.js):
+      # - MAX_USERS_PER_ROOM=50
+      # - EMPTY_ROOM_TTL_MS=300000
+      # - RECONNECT_GRACE_MS=12000
+      # - CHAT_HISTORY_LIMIT=80
+      # - ALLOWED_RATES=0.5,1,1.25,1.5,2
     networks:
       - proxy
     healthcheck:
@@ -17,6 +25,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 10s
 
   watchsync-client:
     image: watchsync-client:latest
@@ -24,9 +33,15 @@ services:
     container_name: watchsync-client
     restart: unless-stopped
     depends_on:
-      - watchsync-server
+      watchsync-server:
+        condition: service_started
     networks:
       - proxy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 networks:
   proxy:

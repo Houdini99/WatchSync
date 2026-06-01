@@ -3,18 +3,27 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="color-scheme" content="dark" />
+  <meta name="color-scheme" content="dark light" />
+  <meta name="description" content="WatchSync — a self-hosted watch-together app. Create a room, share the link, watch in sync." />
   <title>WatchSync</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
   <div id="landing" class="landing">
     <div class="landing-card">
+      <div class="logo-badge">▶</div>
       <h1>WatchSync</h1>
       <p class="tagline">Watch together, perfectly in sync.</p>
-      <button id="create-room" class="btn-primary">Create a Room</button>
+      <button id="create-room" class="btn-primary btn-lg">Create a Room</button>
       <p class="hint">No signup. Share the URL to invite friends.</p>
+      <ul class="feature-pills">
+        <li>YouTube &amp; direct video</li>
+        <li>Live chat &amp; reactions</li>
+        <li>Shared queue</li>
+      </ul>
     </div>
+    <footer class="landing-foot"><span id="landing-version"></span></footer>
   </div>
 
   <div id="nickname-modal" class="modal hidden">
@@ -28,13 +37,19 @@
   <main id="room" class="room hidden">
     <header class="topbar">
       <div class="brand-block">
-        <div class="brand">WatchSync</div>
+        <div class="brand"><span class="brand-mark">▶</span> WatchSync</div>
         <div id="video-title" class="video-title" title=""></div>
       </div>
       <div class="topbar-controls">
         <span id="ping-indicator" class="ping" title="Round-trip latency">…</span>
+        <div class="speed-wrap">
+          <button id="speed-btn" class="btn-icon" title="Playback speed">1×</button>
+          <div id="speed-menu" class="speed-menu hidden"></div>
+        </div>
+        <button id="pip-btn" class="btn-icon hidden" title="Picture-in-picture">⧉</button>
         <button id="resync-btn" class="btn-icon" title="Resync to room">⟳</button>
         <button id="sound-toggle" class="btn-icon" title="Toggle chat sound">🔔</button>
+        <button id="theme-toggle" class="btn-icon" title="Toggle theme">🌙</button>
         <button id="fullscreen-btn" class="btn-icon" title="Fullscreen (F)">⛶</button>
         <button id="copy-link" class="btn-ghost" title="Copy invite link">Copy link</button>
         <label class="lock-toggle hidden" id="lock-wrap">
@@ -49,13 +64,17 @@
     <section class="player-wrap">
       <div id="player-mount" class="player-mount">
         <div id="player-placeholder" class="placeholder">
-          <p>Paste a YouTube or direct video URL below to begin.</p>
+          <div class="placeholder-inner">
+            <div class="placeholder-icon">▶</div>
+            <p>Paste a YouTube or direct video URL below to begin.</p>
+          </div>
         </div>
         <video id="html5-video" class="hidden" controls playsinline></video>
         <div id="yt-mount" class="hidden"></div>
+        <div id="reaction-layer" class="reaction-layer" aria-hidden="true"></div>
       </div>
       <form id="url-form" class="url-form">
-        <input id="url-input" type="url" placeholder="https://youtube.com/watch?v=... or https://example.com/video.mp4" />
+        <input id="url-input" type="url" placeholder="https://youtube.com/watch?v=… or https://example.com/video.mp4" />
         <button type="submit" class="btn-primary">Load</button>
         <button type="button" id="queue-add" class="btn-ghost">+ Queue</button>
       </form>
@@ -72,13 +91,16 @@
 
       <div class="tab-panel active" data-tab-panel="chat">
         <div id="chat-log" class="chat-log"></div>
-        <div class="reactions">
+        <div id="typing-indicator" class="typing-indicator"></div>
+        <div class="reactions" title="Send a floating reaction">
           <button class="react-btn" data-emoji="👍">👍</button>
           <button class="react-btn" data-emoji="❤️">❤️</button>
           <button class="react-btn" data-emoji="😂">😂</button>
           <button class="react-btn" data-emoji="🔥">🔥</button>
+          <button class="react-btn" data-emoji="😮">😮</button>
           <button class="react-btn" data-emoji="👀">👀</button>
           <button class="react-btn" data-emoji="🎉">🎉</button>
+          <button class="react-btn" data-emoji="😢">😢</button>
         </div>
         <form id="chat-form" class="chat-form">
           <input id="chat-input" type="text" maxlength="500" placeholder="Say something…" autocomplete="off" />
@@ -88,6 +110,7 @@
 
       <div class="tab-panel" data-tab-panel="queue">
         <ul id="queue-list" class="queue-list"></ul>
+        <p id="queue-empty" class="empty-hint">Queue is empty. Add videos with <strong>+ Queue</strong>.</p>
         <button id="queue-skip" class="btn-ghost full">Skip to next</button>
       </div>
 

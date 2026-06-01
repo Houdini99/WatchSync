@@ -1,10 +1,11 @@
 {
   "name": "watchsync-server",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
   "dependencies": {
     "@fastify/cors": "^9.0.1",

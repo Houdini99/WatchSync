@@ -5,18 +5,22 @@ A self-hosted "watch together" web app. Create a room, share the link, watch You
 ## Features
 
 - **Instant rooms** — one click creates a shareable URL, no account needed
-- **Tight sync** — server is the source of truth; play, pause, and seek propagate in real time
+- **Tight sync** — server is the source of truth; play, pause, seek, and **playback speed** propagate in real time
+- **Synced playback speed** — 0.25×–2× (configurable); the server extrapolates position by rate so speed changes stay in sync
 - **Buffer-aware** — if someone's stream stalls, the room can auto-pause and resume together
 - **Mid-stream join** — late joiners hard-seek to the current position the moment their player is ready
-- **Host controls** — first user to create the room is host; can lock player controls for everyone else; persistent host token survives reconnects
-- **Queue** — line up multiple videos; the room auto-advances when one ends
-- **YouTube title resolution** — queue entries swap from URL to real video title via YouTube oEmbed
-- **Chat** with timestamps, auto-linking URLs, quick emoji reactions, unread badge, optional ping sound, browser tab title flash
+- **Seamless reconnects** — a stable per-browser identity keeps your seat, nickname, color, and host status across drops; a grace window suppresses join/leave spam on flaky wifi
+- **Host controls** — first user to create the room is host; can lock player controls for everyone else; persistent host token survives reconnects; host migrates cleanly when the host actually leaves
+- **Queue** — line up multiple videos, reorder them, auto-advance when one ends
+- **YouTube title resolution** — queue entries swap from URL to real video title via YouTube oEmbed; deep-links with `?t=` start at the right spot
+- **Chat** with persistent in-room history for late joiners, per-user colors, timestamps, auto-linking URLs, **typing indicators**, unread badge, optional ping sound, browser tab title flash
+- **Floating emoji reactions** — react in the moment; emoji float up over the video for everyone
+- **Picture-in-Picture** for direct/HLS video, plus light/dark theme toggle
 - **Keyboard shortcuts** — Space/K (play/pause), ←/→ (±5s), J/L (±10s), F (fullscreen), M (mute)
 - **Resync button** + live ping indicator in the topbar
 - **Persistent room** toggle (host) — prevents the 5-minute empty-room auto-reap
-- **Dark, mobile-responsive UI** — no build step on the client
-- **Rate-limited chat** + HTML/control-char stripping on chat and nicknames
+- **Dark/light, mobile-responsive UI** — no build step on the client
+- **Hardened** — rate-limited chat/reactions + global flood guard, HTML/control-char stripping, strict CSP and security headers, graceful shutdown
 
 ## Supported media
 
@@ -53,15 +57,16 @@ A self-hosted "watch together" web app. Create a room, share the link, watch You
                   └────────────────────────────────────────┘
 ```
 
-- **Server** holds `{currentTime, paused, lastUpdateAt, queue, users, ...}` per room. Clients send *intents* (play, pause, seek, queue, chat); server validates and broadcasts.
-- **Heartbeat** every 4s for drift correction; broadcasts also carry a `causedBy` socket ID so originators ignore their own echoes.
-- **Two-container split** keeps the Nginx config tiny — NPM only needs to point at the client, which proxies everything else internally.
+- **Server** holds `{currentTime, paused, rate, lastUpdateAt, queue, users, chatHistory, ...}` per room. Clients send *intents* (play, pause, seek, set-rate, queue, chat, reaction, typing); server validates and broadcasts.
+- **Identity** is a stable `clientId` the browser generates once and stores in `localStorage`. Rooms key users by it, so a reconnecting socket reclaims the same seat, nickname, color, and host status. A `RECONNECT_GRACE_MS` window holds the seat before announcing "left" / migrating host.
+- **Heartbeat** every 4s for drift correction; position is extrapolated by wall-clock × playback rate. Broadcasts carry a `causedBy` socket ID so originators ignore their own echoes.
+- **Two-container split** keeps the Nginx config tiny — NPM only needs to point at the client, which proxies everything else internally. The client container also ships the CSP and security headers.
 
 ## Tech stack
 
 - **Server**: Node 20, [Fastify](https://fastify.dev), [Socket.IO](https://socket.io), [nanoid](https://github.com/ai/nanoid)
 - **Client**: Vanilla ES modules, [HLS.js](https://github.com/video-dev/hls.js), [DOMPurify](https://github.com/cure53/DOMPurify), YouTube IFrame API
-- **Infra**: Two containers (Node + Nginx Alpine) on an external Docker network. ~1800 lines of code total, no build step required for either container.
+- **Infra**: Two containers (Node + Nginx Alpine) on an external Docker network. ~2200 lines of code total, no build step required for either container.
 
 ---
 
@@ -190,22 +195,25 @@ Then visit `http://localhost:5173/`.
 
 ## Configuration
 
-All settings via environment variables:
+Everything lives in [server/src/config.js](server/src/config.js) and every knob is overridable via an environment variable — no rebuild needed.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PUBLIC_ORIGIN` | `*` | Origin allowed for Socket.IO CORS. Set to your https URL in production. `*` is fine during testing but allows any origin to connect. |
+| `PUBLIC_ORIGIN` / `CORS_ORIGIN` | `*` | Origin(s) allowed for CORS. Set to your https URL in production; `*` reflects any origin (testing only). Comma-separate for several. |
 | `PORT` | `3000` | Server listen port (internal — change only if you customize the Nginx proxy line in [client/nginx.conf](client/nginx.conf)) |
 | `HOST` | `0.0.0.0` | Server bind address |
 | `LOG_LEVEL` | `info` | Fastify logger level: `trace` / `debug` / `info` / `warn` / `error` |
+| `MAX_USERS_PER_ROOM` | `50` | Hard cap on live users per room |
+| `MAX_ROOMS` | `5000` | Global room cap (evicts the oldest empty room when full) |
+| `MAX_QUEUE_LENGTH` | `200` | Max items in a room's queue |
+| `CHAT_HISTORY_LIMIT` | `80` | Messages retained per room and replayed to late joiners |
+| `EMPTY_ROOM_TTL_MS` | `300000` | Reap empty, non-persistent rooms after this long |
+| `RECONNECT_GRACE_MS` | `12000` | Hold a dropped user's seat this long before "left" / host migration |
+| `HEARTBEAT_MS` | `4000` | Drift-correction broadcast interval |
+| `DRIFT_TOLERANCE_SEC` | `1.5` | How far out of sync before a hard correction |
+| `ALLOWED_RATES` | `0.25,0.5,…,2` | Comma-separated playback speeds offered in the UI |
 
-There are no other knobs. Room/chat limits are constants in code:
-
-- Max 50 users per room
-- Chat rate limit: 5 messages per 10 seconds per socket
-- Nickname max 24 chars, chat message max 500 chars
-- Empty rooms reaped after 5 minutes (unless host marked **Persist**)
-- Heartbeat interval: 4 seconds; drift tolerance: 1.5 seconds; local-action grace: 2 seconds
+Other constants (nickname/chat length, token-bucket rates) are also in `config.js` and env-tunable; see the file for the full list. Empty rooms are reaped after the TTL unless the host marks the room **Persist**.
 
 ## Optional extensions
 

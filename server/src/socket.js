@@ -1,23 +1,28 @@
-import { sanitizeNickname, sanitizeChat, sanitizeUrl } from './sanitize.js';
+import { sanitizeNickname, sanitizeChat, sanitizeUrl, sanitizeClientId, sanitizeReaction } from './sanitize.js';
 import { TokenBucket } from './rateLimiter.js';
 import { detectMedia, enrichMedia } from './media.js';
-
-const HEARTBEAT_MS = 4000;
-const EMPTY_ROOM_TTL_MS = 5 * 60 * 1000;
+import { config } from './config.js';
 
 export function attachSockets(io, rooms) {
-  const buckets = new WeakMap();
+  // Per-socket rate limiters and bookkeeping live keyed by the socket object.
+  const meta = new WeakMap();
   const reapTimers = new Map();
+  // Pending "user left" timers, keyed `${roomId}:${clientId}`, so a quick
+  // reconnect cancels the announcement and host migration.
+  const leaveTimers = new Map();
+
+  const leaveKey = (roomId, clientId) => `${roomId}:${clientId}`;
 
   function scheduleReap(roomId) {
     if (reapTimers.has(roomId)) return;
     const room = rooms.get(roomId);
     if (room?.persistent) return;
     const t = setTimeout(() => {
-      const r = rooms.get(roomId);
-      if (r && r.users.size === 0 && !r.persistent) rooms.delete(roomId);
       reapTimers.delete(roomId);
-    }, EMPTY_ROOM_TTL_MS);
+      const r = rooms.get(roomId);
+      if (r && rooms.liveUserCount(r) === 0 && !r.persistent) rooms.delete(roomId);
+    }, config.emptyRoomTtlMs);
+    if (t.unref) t.unref();
     reapTimers.set(roomId, t);
   }
 
@@ -32,45 +37,80 @@ export function attachSockets(io, rooms) {
     io.to(room.id).emit('room_state', snap);
   }
 
-  function systemMessage(roomId, text) {
-    io.to(roomId).emit('system_message', { text, ts: Date.now() });
+  function systemMessage(room, text) {
+    const entry = { kind: 'system', text, ts: Date.now() };
+    rooms.pushChat(room, entry);
+    io.to(room.id).emit('system_message', { text: entry.text, ts: entry.ts });
   }
 
   setInterval(() => {
     for (const room of rooms.rooms.values()) {
-      if (room.users.size === 0 || !room.video.media) continue;
+      if (rooms.liveUserCount(room) === 0 || !room.video.media) continue;
       io.to(room.id).emit('heartbeat', {
         currentTime: rooms.computeLiveTime(room),
         paused: room.video.paused,
+        rate: room.video.rate || 1,
         serverTime: Date.now(),
       });
     }
-  }, HEARTBEAT_MS);
+  }, config.heartbeatMs).unref?.();
 
   io.on('connection', (socket) => {
-    buckets.set(socket, new TokenBucket(5, 0.5));
-    let joinedRoomId = null;
+    meta.set(socket, {
+      chat: new TokenBucket(config.chatBucket.capacity, config.chatBucket.refillPerSec),
+      reaction: new TokenBucket(config.reactionBucket.capacity, config.reactionBucket.refillPerSec),
+      global: new TokenBucket(config.globalBucket.capacity, config.globalBucket.refillPerSec),
+      roomId: null,
+      clientId: null,
+    });
+
+    // Cheap flood guard applied to the chatty real-time events.
+    function allow() {
+      const m = meta.get(socket);
+      return m ? m.global.take(1) : false;
+    }
 
     socket.on('join_room', (payload, ack) => {
       const roomId = String(payload?.roomId || '').trim();
       const nickname = sanitizeNickname(payload?.nickname);
+      const clientId = sanitizeClientId(payload?.clientId) || `s_${socket.id}`;
       const hostToken = String(payload?.hostToken || '');
       const room = rooms.get(roomId);
       if (!room) return ack?.({ ok: false, error: 'Room not found' });
-      if (room.users.size >= 50) return ack?.({ ok: false, error: 'Room is full' });
 
-      socket.join(roomId);
-      joinedRoomId = roomId;
-      cancelReap(roomId);
-      rooms.addUser(room, socket.id, nickname);
-
-      if (!room.hostSocketId || (hostToken && hostToken === room.hostToken)) {
-        rooms.setHost(room, socket.id);
+      const m = meta.get(socket);
+      const already = room.users.get(clientId);
+      // Block only genuinely new seats once full; reconnects always get back in.
+      if (!already && rooms.liveUserCount(room) >= config.maxUsersPerRoom) {
+        return ack?.({ ok: false, error: 'Room is full' });
       }
 
-      systemMessage(roomId, `${nickname} joined`);
+      socket.join(roomId);
+      m.roomId = roomId;
+      m.clientId = clientId;
+      cancelReap(roomId);
+
+      // A pending "left" announcement means this is a reconnect within grace.
+      const pending = leaveTimers.get(leaveKey(roomId, clientId));
+      if (pending) { clearTimeout(pending); leaveTimers.delete(leaveKey(roomId, clientId)); }
+
+      const { user, reconnected } = rooms.addUser(room, clientId, socket.id, nickname);
+
+      if (!room.hostClientId || rooms.isHostToken(room, hostToken)) {
+        rooms.setHost(room, clientId);
+      }
+
+      if (!reconnected) systemMessage(room, `${user.nickname} joined`);
       broadcastState(room, socket.id);
-      ack?.({ ok: true, snapshot: rooms.snapshot(room), youAreHost: room.hostSocketId === socket.id });
+
+      ack?.({
+        ok: true,
+        youAreHost: room.hostClientId === clientId,
+        clientId,
+        snapshot: rooms.snapshot(room),
+        chatHistory: room.chatHistory.slice(-config.chatHistoryLimit),
+        config: { allowedRates: config.allowedRates, maxQueueLength: config.maxQueueLength },
+      });
     });
 
     socket.on('change_video', (payload, ack) => {
@@ -82,8 +122,7 @@ export function attachSockets(io, rooms) {
       const media = detectMedia(url);
       if (!media) return ack?.({ ok: false, error: 'Unsupported media' });
       rooms.setMedia(room, media);
-      const nickname = room.users.get(socket.id)?.nickname || 'someone';
-      systemMessage(room.id, `${nickname} changed the video`);
+      systemMessage(room, `${nickOf(room)} changed the video`);
       broadcastState(room, socket.id);
       ack?.({ ok: true });
       enrichMedia(media).then((changed) => {
@@ -93,7 +132,7 @@ export function attachSockets(io, rooms) {
 
     socket.on('play_pause', (payload) => {
       const room = currentRoom();
-      if (!room || !room.video.media) return;
+      if (!room || !room.video.media || !allow()) return;
       if (!isHost(room) && room.locked) return;
       rooms.updateVideoState(room, {
         paused: !!payload?.paused,
@@ -104,7 +143,7 @@ export function attachSockets(io, rooms) {
 
     socket.on('seek', (payload) => {
       const room = currentRoom();
-      if (!room || !room.video.media) return;
+      if (!room || !room.video.media || !allow()) return;
       if (!isHost(room) && room.locked) return;
       rooms.updateVideoState(room, {
         currentTime: Number(payload?.currentTime),
@@ -113,17 +152,27 @@ export function attachSockets(io, rooms) {
       broadcastState(room, socket.id);
     });
 
-    socket.on('buffering_start', () => {
+    socket.on('set_rate', (payload) => {
       const room = currentRoom();
       if (!room || !room.video.media) return;
-      const r = rooms.setBuffering(room, socket.id, true);
+      if (!isHost(room) && room.locked) return;
+      if (rooms.setRate(room, payload?.rate)) {
+        systemMessage(room, `${nickOf(room)} set speed to ${room.video.rate}×`);
+        broadcastState(room, socket.id);
+      }
+    });
+
+    socket.on('buffering_start', () => {
+      const room = currentRoom();
+      if (!room || !room.video.media || !allow()) return;
+      const r = rooms.setBuffering(room, meta.get(socket)?.clientId, true);
       if (r.changed) broadcastState(room, socket.id);
     });
 
     socket.on('buffering_end', () => {
       const room = currentRoom();
-      if (!room || !room.video.media) return;
-      const r = rooms.setBuffering(room, socket.id, false);
+      if (!room || !room.video.media || !allow()) return;
+      const r = rooms.setBuffering(room, meta.get(socket)?.clientId, false);
       if (r.changed) broadcastState(room, socket.id);
     });
 
@@ -135,14 +184,12 @@ export function attachSockets(io, rooms) {
       if (!url) return ack?.({ ok: false, error: 'Invalid URL' });
       const media = detectMedia(url);
       if (!media) return ack?.({ ok: false, error: 'Unsupported media' });
-      rooms.enqueue(room, media);
+      if (!rooms.enqueue(room, media)) return ack?.({ ok: false, error: 'Queue is full' });
       broadcastState(room, socket.id);
       ack?.({ ok: true });
       enrichMedia(media).then((changed) => {
         if (!changed) return;
-        if (room.queue.includes(media) || room.video.media === media) {
-          broadcastState(room, null);
-        }
+        if (room.queue.includes(media) || room.video.media === media) broadcastState(room, null);
       }).catch(() => {});
     });
 
@@ -150,8 +197,16 @@ export function attachSockets(io, rooms) {
       const room = currentRoom();
       if (!room) return;
       if (!isHost(room) && room.locked) return;
-      rooms.dequeueAt(room, Number(payload?.index));
-      broadcastState(room, socket.id);
+      if (rooms.dequeueAt(room, Number(payload?.index)) !== null) broadcastState(room, socket.id);
+    });
+
+    socket.on('queue_move', (payload) => {
+      const room = currentRoom();
+      if (!room) return;
+      if (!isHost(room) && room.locked) return;
+      if (rooms.moveQueueItem(room, Number(payload?.from), Number(payload?.to))) {
+        broadcastState(room, socket.id);
+      }
     });
 
     socket.on('queue_skip', () => {
@@ -159,25 +214,25 @@ export function attachSockets(io, rooms) {
       if (!room) return;
       if (!isHost(room) && room.locked) return;
       const next = rooms.shiftQueue(room);
-      const nickname = room.users.get(socket.id)?.nickname || 'host';
       if (next) {
         rooms.setMedia(room, next);
-        systemMessage(room.id, `${nickname} skipped to the next video`);
+        systemMessage(room, `${nickOf(room)} skipped to the next video`);
+        broadcastState(room, socket.id);
+        enrichMedia(next).then((changed) => {
+          if (changed && room.video.media === next) broadcastState(room, null);
+        }).catch(() => {});
       } else {
-        room.video.media = null;
-        room.video.paused = true;
-        room.video.currentTime = 0;
-        room.video.lastUpdateAt = Date.now();
-        systemMessage(room.id, `${nickname} skipped — queue empty`);
+        rooms.clearMedia(room);
+        systemMessage(room, `${nickOf(room)} skipped — queue empty`);
+        broadcastState(room, socket.id);
       }
-      broadcastState(room, socket.id);
     });
 
     socket.on('lock_room', (payload) => {
       const room = currentRoom();
       if (!room || !isHost(room)) return;
       room.locked = !!payload?.locked;
-      systemMessage(room.id, `Host ${room.locked ? 'locked' : 'unlocked'} controls`);
+      systemMessage(room, `Host ${room.locked ? 'locked' : 'unlocked'} controls`);
       broadcastState(room, socket.id);
     });
 
@@ -186,7 +241,7 @@ export function attachSockets(io, rooms) {
       if (!room || !isHost(room)) return;
       rooms.setPersistent(room, !!payload?.persistent);
       if (room.persistent) cancelReap(room.id);
-      systemMessage(room.id, `Room is now ${room.persistent ? 'persistent' : 'ephemeral'}`);
+      systemMessage(room, `Room is now ${room.persistent ? 'persistent' : 'ephemeral'}`);
       broadcastState(room, socket.id);
     });
 
@@ -201,22 +256,63 @@ export function attachSockets(io, rooms) {
     socket.on('chat_message', (payload) => {
       const room = currentRoom();
       if (!room) return;
-      const bucket = buckets.get(socket);
-      if (!bucket || !bucket.take(1)) return;
+      const m = meta.get(socket);
+      if (!m || !m.chat.take(1)) return;
       const text = sanitizeChat(payload?.text);
       if (!text) return;
-      const nickname = room.users.get(socket.id)?.nickname || 'guest';
-      io.to(room.id).emit('chat_message', {
-        nickname,
+      const user = room.users.get(m.clientId);
+      const entry = {
+        kind: 'chat',
+        nickname: user?.nickname || 'guest',
+        color: user?.color || null,
         text,
-        socketId: socket.id,
+        clientId: m.clientId,
         ts: Date.now(),
+      };
+      rooms.pushChat(room, entry);
+      io.to(room.id).emit('chat_message', {
+        nickname: entry.nickname,
+        color: entry.color,
+        text: entry.text,
+        clientId: entry.clientId,
+        socketId: socket.id,
+        ts: entry.ts,
+      });
+    });
+
+    socket.on('reaction', (payload) => {
+      const room = currentRoom();
+      if (!room) return;
+      const m = meta.get(socket);
+      if (!m || !m.reaction.take(1)) return;
+      const emoji = sanitizeReaction(payload?.emoji);
+      if (!emoji) return;
+      const user = room.users.get(m.clientId);
+      io.to(room.id).emit('reaction', {
+        emoji,
+        nickname: user?.nickname || 'guest',
+        color: user?.color || null,
+        clientId: m.clientId,
+        ts: Date.now(),
+      });
+    });
+
+    socket.on('typing', (payload) => {
+      const room = currentRoom();
+      if (!room || !allow()) return;
+      const m = meta.get(socket);
+      const user = room.users.get(m?.clientId);
+      if (!user) return;
+      socket.to(room.id).emit('typing', {
+        clientId: user.clientId,
+        nickname: user.nickname,
+        typing: !!payload?.typing,
       });
     });
 
     socket.on('sync_request', (ack) => {
       const room = currentRoom();
-      if (!room) return;
+      if (!room) return ack?.(null);
       ack?.(rooms.snapshot(room));
     });
 
@@ -225,34 +321,50 @@ export function attachSockets(io, rooms) {
     });
 
     socket.on('disconnect', () => {
-      if (!joinedRoomId) return;
-      const room = rooms.get(joinedRoomId);
+      const m = meta.get(socket);
+      meta.delete(socket);
+      if (!m?.roomId || !m.clientId) return;
+      const room = rooms.get(m.roomId);
       if (!room) return;
-      const wasHost = room.hostSocketId === socket.id;
-      const user = room.users.get(socket.id);
-      rooms.removeUser(room, socket.id);
-      if (user) systemMessage(joinedRoomId, `${user.nickname} left`);
+      const user = room.users.get(m.clientId);
+      // Stale socket from a same-clientId takeover (newer tab won the seat).
+      if (!user || user.socketId !== socket.id) return;
 
-      if (wasHost) {
-        const next = room.users.values().next().value;
-        if (next) {
-          rooms.setHost(room, next.socketId);
-          systemMessage(joinedRoomId, `${next.nickname} is now the host`);
+      rooms.markDisconnected(room, m.clientId);
+      broadcastState(room, null); // others immediately see the seat grey out
+
+      const key = leaveKey(m.roomId, m.clientId);
+      if (leaveTimers.has(key)) return;
+      const timer = setTimeout(() => {
+        leaveTimers.delete(key);
+        const r = rooms.get(m.roomId);
+        if (!r) return;
+        const u = r.users.get(m.clientId);
+        if (!u || !u.disconnected) return; // reconnected in the meantime
+
+        const wasHost = r.hostClientId === m.clientId;
+        rooms.removeUser(r, m.clientId);
+        systemMessage(r, `${u.nickname} left`);
+        if (wasHost) {
+          const next = rooms.migrateHost(r);
+          if (next) systemMessage(r, `${next.nickname} is now the host`);
         }
-      }
+        rooms.reconcileAutoPause(r);
 
-      const any = [...room.users.values()].some(u => u.buffering);
-      if (!any && room.video.paused && room.video.autoPaused) {
-        room.video.paused = false;
-        room.video.autoPaused = false;
-        room.video.lastUpdateAt = Date.now();
-      }
-
-      if (room.users.size === 0) scheduleReap(joinedRoomId);
-      else broadcastState(room, null);
+        if (rooms.liveUserCount(r) === 0) scheduleReap(m.roomId);
+        else broadcastState(r, null);
+      }, config.reconnectGraceMs);
+      if (timer.unref) timer.unref();
+      leaveTimers.set(key, timer);
     });
 
-    function currentRoom() { return joinedRoomId ? rooms.get(joinedRoomId) : null; }
-    function isHost(room) { return room.hostSocketId === socket.id; }
+    function currentRoom() {
+      const m = meta.get(socket);
+      return m?.roomId ? rooms.get(m.roomId) : null;
+    }
+    function isHost(room) { return room.hostClientId === meta.get(socket)?.clientId; }
+    function nickOf(room) {
+      return room.users.get(meta.get(socket)?.clientId)?.nickname || 'someone';
+    }
   });
 }

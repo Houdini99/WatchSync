@@ -1,5 +1,5 @@
 // Player abstraction: HTML5 video (native + HLS) and YouTube IFrame API.
-// Emits events: play, pause, seek, buffering, timeupdate, ready, ended.
+// Emits events: play, pause, seek, ratechange, buffering, timeupdate, ready, ended.
 
 export class PlayerEvents extends EventTarget {
   fire(type, detail) { this.dispatchEvent(new CustomEvent(type, { detail })); }
@@ -28,21 +28,35 @@ export class Html5Player {
       this._lastSeek = now;
       this.events.fire('seek', { currentTime: videoEl.currentTime });
     });
+    videoEl.addEventListener('ratechange', () => {
+      if (this._suppress) return;
+      this.events.fire('ratechange', { rate: videoEl.playbackRate });
+    });
     videoEl.addEventListener('waiting', () => this.events.fire('buffering', { buffering: true }));
     videoEl.addEventListener('canplay', () => this.events.fire('buffering', { buffering: false }));
     videoEl.addEventListener('playing', () => this.events.fire('buffering', { buffering: false }));
     videoEl.addEventListener('ended', () => this.events.fire('ended'));
     videoEl.addEventListener('loadedmetadata', () => this.events.fire('ready'));
+    videoEl.addEventListener('error', () => this.events.fire('mediaerror', { code: videoEl.error?.code }));
   }
 
   load(media) {
     if (this._hls) { try { this._hls.destroy(); } catch {} this._hls = null; }
     this.video.classList.remove('hidden');
 
-    if (media.type === 'hls' && window.Hls && window.Hls.isSupported()) {
-      this._hls = new window.Hls({ maxBufferLength: 30 });
-      this._hls.loadSource(media.source);
-      this._hls.attachMedia(this.video);
+    if (media.type === 'hls') {
+      if (this.video.canPlayType('application/vnd.apple.mpegurl')) {
+        this.video.src = media.source; // Safari plays HLS natively
+      } else if (window.Hls && window.Hls.isSupported()) {
+        this._hls = new window.Hls({ maxBufferLength: 30, enableWorker: true });
+        this._hls.on(window.Hls.Events.ERROR, (_e, data) => {
+          if (data?.fatal) this.events.fire('mediaerror', { code: data.type });
+        });
+        this._hls.loadSource(media.source);
+        this._hls.attachMedia(this.video);
+      } else {
+        this.events.fire('mediaerror', { code: 'hls-unsupported' });
+      }
     } else {
       this.video.src = media.source;
     }
@@ -50,12 +64,14 @@ export class Html5Player {
 
   unload() {
     if (this._hls) { try { this._hls.destroy(); } catch {} this._hls = null; }
+    try { if (document.pictureInPictureElement === this.video) document.exitPictureInPicture(); } catch {}
     this.video.removeAttribute('src');
     this.video.load();
     this.video.classList.add('hidden');
   }
 
   getTime() { return this.video.currentTime || 0; }
+  getRate() { return this.video.playbackRate || 1; }
   isPaused() { return this.video.paused; }
   isSeeking() { return this.video.seeking; }
   getTitle() { return null; }
@@ -67,8 +83,11 @@ export class Html5Player {
     }
   }
 
-  async applyState({ currentTime, paused }) {
+  async applyState({ currentTime, paused, rate }) {
     this.withSuppression(() => {
+      if (typeof rate === 'number' && Math.abs(this.video.playbackRate - rate) > 0.001) {
+        try { this.video.playbackRate = rate; } catch {}
+      }
       if (typeof currentTime === 'number' && Math.abs(this.video.currentTime - currentTime) > 0.4) {
         try { this.video.currentTime = currentTime; } catch {}
       }
@@ -78,6 +97,10 @@ export class Html5Player {
         if (p && p.catch) p.catch(() => {});
       }
     });
+  }
+
+  setRate(rate) {
+    try { this.video.playbackRate = rate; } catch {}
   }
 
   setEnabled(enabled) {
@@ -90,6 +113,8 @@ export class Html5Player {
     return this.video.muted;
   }
 
+  setVolume(v) { this.video.volume = Math.max(0, Math.min(1, v)); this.video.muted = false; }
+
   seekBy(deltaSec) {
     try { this.video.currentTime = Math.max(0, this.video.currentTime + deltaSec); } catch {}
   }
@@ -101,6 +126,14 @@ export class Html5Player {
     } else {
       this.video.pause();
     }
+  }
+
+  supportsPiP() { return !!document.pictureInPictureEnabled && !this.video.disablePictureInPicture; }
+  async togglePiP() {
+    try {
+      if (document.pictureInPictureElement === this.video) await document.exitPictureInPicture();
+      else await this.video.requestPictureInPicture();
+    } catch {}
   }
 }
 
@@ -126,10 +159,15 @@ export class YouTubePlayer {
 
     this._yt = new window.YT.Player('yt-iframe-target', {
       videoId: media.id,
-      playerVars: { autoplay: 1, modestbranding: 1, rel: 0, playsinline: 1, controls: 1 },
+      playerVars: {
+        autoplay: 1, modestbranding: 1, rel: 0, playsinline: 1, controls: 1,
+        start: Number.isFinite(media.start) ? Math.floor(media.start) : 0,
+      },
       events: {
         onReady: () => { this._ready = true; this.events.fire('ready'); this._startPolling(); },
         onStateChange: (e) => this._onStateChange(e),
+        onPlaybackRateChange: (e) => { if (!this._suppress) this.events.fire('ratechange', { rate: e.data }); },
+        onError: (e) => this.events.fire('mediaerror', { code: e?.data }),
       },
     });
   }
@@ -178,6 +216,9 @@ export class YouTubePlayer {
   getTime() {
     try { return this._ready ? this._yt.getCurrentTime() : 0; } catch { return 0; }
   }
+  getRate() {
+    try { return this._yt.getPlaybackRate() || 1; } catch { return 1; }
+  }
   isPaused() {
     try { return this._yt.getPlayerState() !== window.YT.PlayerState.PLAYING; } catch { return true; }
   }
@@ -196,7 +237,7 @@ export class YouTubePlayer {
     try { fn(); } finally { setTimeout(() => { this._suppress = false; }, 200); }
   }
 
-  async applyState({ currentTime, paused }) {
+  async applyState({ currentTime, paused, rate }) {
     if (!this._ready) {
       await new Promise((r) => {
         const h = () => { this.events.removeEventListener('ready', h); r(); };
@@ -205,6 +246,9 @@ export class YouTubePlayer {
     }
     this.withSuppression(() => {
       try {
+        if (typeof rate === 'number' && Math.abs(this.getRate() - rate) > 0.001) {
+          this._yt.setPlaybackRate(rate);
+        }
         if (typeof currentTime === 'number' && Math.abs(this.getTime() - currentTime) > 0.6) {
           this._yt.seekTo(currentTime, true);
         }
@@ -213,6 +257,8 @@ export class YouTubePlayer {
       } catch {}
     });
   }
+
+  setRate(rate) { try { this._yt.setPlaybackRate(rate); } catch {} }
 
   setEnabled(enabled) {
     this.mount.style.pointerEvents = enabled ? '' : 'none';
@@ -224,6 +270,8 @@ export class YouTubePlayer {
       this._yt.mute(); return true;
     } catch { return false; }
   }
+
+  setVolume(v) { try { this._yt.unMute(); this._yt.setVolume(Math.round(Math.max(0, Math.min(1, v)) * 100)); } catch {} }
 
   seekBy(deltaSec) {
     try {
@@ -238,6 +286,9 @@ export class YouTubePlayer {
       else this._yt.pauseVideo();
     } catch {}
   }
+
+  supportsPiP() { return false; }
+  async togglePiP() {}
 }
 
 export function pickPlayer(media, { videoEl, ytMount }) {

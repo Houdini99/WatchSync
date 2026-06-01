@@ -6,6 +6,7 @@ const purify = (s) => (window.DOMPurify ? window.DOMPurify.sanitize(s, { ALLOWED
 
 const els = {
   landing: $('#landing'),
+  landingVersion: $('#landing-version'),
   createRoom: $('#create-room'),
   nicknameModal: $('#nickname-modal'),
   nicknameInput: $('#nickname-input'),
@@ -13,8 +14,12 @@ const els = {
   room: $('#room'),
   videoTitle: $('#video-title'),
   pingIndicator: $('#ping-indicator'),
+  speedBtn: $('#speed-btn'),
+  speedMenu: $('#speed-menu'),
+  pipBtn: $('#pip-btn'),
   resyncBtn: $('#resync-btn'),
   soundToggle: $('#sound-toggle'),
+  themeToggle: $('#theme-toggle'),
   fullscreenBtn: $('#fullscreen-btn'),
   copyLink: $('#copy-link'),
   lockWrap: $('#lock-wrap'),
@@ -25,6 +30,7 @@ const els = {
   placeholder: $('#player-placeholder'),
   video: $('#html5-video'),
   ytMount: $('#yt-mount'),
+  reactionLayer: $('#reaction-layer'),
   urlForm: $('#url-form'),
   urlInput: $('#url-input'),
   queueAdd: $('#queue-add'),
@@ -35,8 +41,10 @@ const els = {
   chatLog: $('#chat-log'),
   chatForm: $('#chat-form'),
   chatInput: $('#chat-input'),
+  typingIndicator: $('#typing-indicator'),
   reactions: document.querySelectorAll('.react-btn'),
   queueList: $('#queue-list'),
+  queueEmpty: $('#queue-empty'),
   queueCount: $('#queue-count'),
   queueSkip: $('#queue-skip'),
   userList: $('#user-list'),
@@ -48,12 +56,15 @@ const els = {
 const state = {
   socket: null,
   roomId: null,
+  clientId: ensureClientId(),
   hostToken: null,
   nickname: null,
   isHost: false,
   locked: false,
   persistent: false,
   currentMedia: null,
+  currentRate: 1,
+  allowedRates: [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2],
   player: null,
   sync: null,
   activeTab: 'chat',
@@ -61,7 +72,34 @@ const state = {
   soundEnabled: localStorage.getItem('ws_sound') !== '0',
   baseTitle: 'WatchSync',
   ytTitlePoll: null,
+  typers: new Map(),
+  typingSent: false,
+  typingTimer: null,
+  hasJoinedOnce: false,
 };
+
+// ---------- identity / theme ----------
+function ensureClientId() {
+  let id = localStorage.getItem('ws_client_id');
+  if (!id || id.length < 8) {
+    id = (crypto.randomUUID ? crypto.randomUUID() : `c${Date.now()}${Math.random().toString(36).slice(2)}`)
+      .replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+    localStorage.setItem('ws_client_id', id);
+  }
+  return id;
+}
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  els.themeToggle.textContent = theme === 'light' ? '☀️' : '🌙';
+}
+applyTheme(localStorage.getItem('ws_theme') || 'dark');
+
+els.themeToggle.addEventListener('click', () => {
+  const next = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+  localStorage.setItem('ws_theme', next);
+  applyTheme(next);
+});
 
 // ---------- routing ----------
 function readRoomFromUrl() {
@@ -73,6 +111,9 @@ async function boot() {
   const roomId = readRoomFromUrl();
   if (roomId) showNicknameModal(roomId);
   else showLanding();
+  fetch('/api/health').then((r) => r.json()).then((h) => {
+    if (h?.version && els.landingVersion) els.landingVersion.textContent = `v${h.version}`;
+  }).catch(() => {});
 }
 
 function showLanding() {
@@ -102,6 +143,7 @@ els.createRoom.addEventListener('click', async () => {
     showNicknameModal(id);
   } catch (e) {
     toast(e.message);
+  } finally {
     els.createRoom.disabled = false;
   }
 });
@@ -123,6 +165,7 @@ async function joinRoom() {
 
 // ---------- socket ----------
 function connectSocket() {
+  if (state.socket) return; // guard against double-connect
   state.socket = io({ path: '/socket.io', transports: ['websocket', 'polling'] });
   state.sync = new SyncEngine(state.socket);
 
@@ -132,6 +175,7 @@ function connectSocket() {
     state.socket.emit('join_room', {
       roomId: state.roomId,
       nickname: state.nickname,
+      clientId: state.clientId,
       hostToken: state.hostToken,
     }, (resp) => {
       if (!resp?.ok) {
@@ -140,27 +184,46 @@ function connectSocket() {
         return;
       }
       state.isHost = resp.youAreHost;
+      if (resp.config?.allowedRates?.length) {
+        state.allowedRates = resp.config.allowedRates;
+        renderSpeedMenu();
+      }
+      if (!state.hasJoinedOnce && Array.isArray(resp.chatHistory)) {
+        renderChatHistory(resp.chatHistory);
+      }
+      state.hasJoinedOnce = true;
+      setStatus('');
       applySnapshot(resp.snapshot, /* initial */ true);
+      // Snap straight to the room's live position on join/reconnect instead of
+      // drifting in until the next heartbeat. Safe to call once the player exists.
+      if (state.player && resp.snapshot?.video?.media) {
+        state.sync.applyInitial(resp.snapshot.video);
+      }
     });
   });
 
   state.socket.on('connect_error', () => setStatus('Disconnected — retrying…', true));
   state.socket.on('disconnect', () => setStatus('Disconnected — retrying…', true));
-  state.socket.on('reconnect', () => setStatus(''));
+  state.socket.io.on('reconnect', () => setStatus(''));
 
   state.socket.on('room_state', (snap) => applySnapshot(snap, false));
   state.socket.on('chat_message', appendChat);
   state.socket.on('system_message', appendSystem);
+  state.socket.on('reaction', showReaction);
+  state.socket.on('typing', onTyping);
 }
 
 function applySnapshot(snap, isInitial) {
   state.locked = snap.locked;
   state.persistent = !!snap.persistent;
-  state.isHost = snap.hostSocketId === state.socket.id;
+  state.isHost = snap.hostClientId
+    ? snap.hostClientId === state.clientId
+    : snap.hostSocketId === state.socket.id;
   renderUsers(snap.users);
   renderQueue(snap.queue);
   applyLockUI();
   applyPersistUI();
+  updateRateUI(snap.video?.rate || 1);
 
   const mediaChanged =
     snap.video?.media?.source !== state.currentMedia?.source ||
@@ -189,6 +252,8 @@ function loadMedia(media, initialVideoState) {
   applyLockUI();
   updateVideoTitle(media.title);
   showMediaWarning(media);
+  updatePipButton();
+  bindMediaErrors();
 
   // YouTube: title resolves once iframe loads; poll briefly and broadcast.
   if (media.type === 'youtube') {
@@ -200,13 +265,17 @@ function loadMedia(media, initialVideoState) {
       if (t) {
         clearInterval(state.ytTitlePoll);
         state.ytTitlePoll = null;
-        if (t !== media.title) {
-          state.socket.emit('media_title', { title: t });
-        }
+        if (t !== media.title) state.socket.emit('media_title', { title: t });
       }
       if (tries > 20) { clearInterval(state.ytTitlePoll); state.ytTitlePoll = null; }
     }, 500);
   }
+}
+
+function bindMediaErrors() {
+  state.player?.events.addEventListener('mediaerror', () => {
+    setStatus('This media failed to load — check the URL, CORS, or codec.', true);
+  });
 }
 
 function teardownPlayer() {
@@ -219,6 +288,7 @@ function teardownPlayer() {
   els.placeholder.classList.remove('hidden');
   updateVideoTitle(null);
   els.mediaWarning.classList.add('hidden');
+  updatePipButton();
 }
 
 function showMediaWarning(media) {
@@ -238,8 +308,7 @@ function updateVideoTitle(title) {
   const t = title && String(title).trim();
   els.videoTitle.textContent = t || '';
   els.videoTitle.title = t || '';
-  document.title = t ? `${t} — ${state.baseTitle}` : state.baseTitle;
-  if (state.unread > 0) document.title = `(${state.unread}) ${document.title}`;
+  refreshTabTitle();
 }
 
 // ---------- url / queue ----------
@@ -264,11 +333,63 @@ els.queueAdd.addEventListener('click', () => {
 
 els.queueSkip.addEventListener('click', () => state.socket.emit('queue_skip'));
 
+// ---------- speed control ----------
+function renderSpeedMenu() {
+  els.speedMenu.innerHTML = '';
+  state.allowedRates.forEach((rate) => {
+    const btn = document.createElement('button');
+    btn.className = 'speed-option';
+    btn.textContent = `${rate}×`;
+    btn.dataset.rate = rate;
+    btn.addEventListener('click', () => {
+      setRate(rate);
+      closeSpeedMenu();
+    });
+    els.speedMenu.appendChild(btn);
+  });
+  updateRateUI(state.currentRate);
+}
+
+// Apply a speed change locally *and* tell the server. Applying to our own
+// player matters: the server echoes the broadcast back with causedBy=us, which
+// the sync engine ignores — so without the local apply the originator's video
+// would never actually change speed.
+function setRate(rate) {
+  if (state.locked && !state.isHost) return toast('Host has locked controls');
+  if (state.player) state.player.setRate(rate);
+  updateRateUI(rate);
+  state.socket.emit('set_rate', { rate });
+}
+
+function updateRateUI(rate) {
+  state.currentRate = rate;
+  els.speedBtn.textContent = `${rate}×`;
+  els.speedBtn.classList.toggle('active', rate !== 1);
+  els.speedMenu.querySelectorAll('.speed-option').forEach((b) => {
+    b.classList.toggle('selected', Number(b.dataset.rate) === rate);
+  });
+}
+
+function closeSpeedMenu() { els.speedMenu.classList.add('hidden'); }
+els.speedBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (state.locked && !state.isHost) return toast('Host has locked controls');
+  els.speedMenu.classList.toggle('hidden');
+});
+document.addEventListener('click', closeSpeedMenu);
+els.speedMenu.addEventListener('click', (e) => e.stopPropagation());
+
+// ---------- PiP ----------
+function updatePipButton() {
+  const show = state.player && state.currentMedia?.type !== 'youtube' && state.player.supportsPiP?.();
+  els.pipBtn.classList.toggle('hidden', !show);
+}
+els.pipBtn.addEventListener('click', () => state.player?.togglePiP?.());
+
 // ---------- host controls ----------
 els.lockToggle.addEventListener('change', () => {
   state.socket.emit('lock_room', { locked: els.lockToggle.checked });
 });
-
 els.persistToggle.addEventListener('change', () => {
   state.socket.emit('set_persistent', { persistent: els.persistToggle.checked });
 });
@@ -281,9 +402,11 @@ els.copyLink.addEventListener('click', async () => {
 
 els.resyncBtn.addEventListener('click', async () => {
   els.resyncBtn.disabled = true;
+  els.resyncBtn.classList.add('spinning');
   const ok = await state.sync.resync();
   toast(ok ? 'Resynced' : 'Resync failed');
   els.resyncBtn.disabled = false;
+  els.resyncBtn.classList.remove('spinning');
 });
 
 els.fullscreenBtn.addEventListener('click', toggleFullscreen);
@@ -317,10 +440,30 @@ els.chatForm.addEventListener('submit', (e) => {
   e.preventDefault();
   sendChat(els.chatInput.value);
   els.chatInput.value = '';
+  signalTyping(false);
 });
 
+els.chatInput.addEventListener('input', () => {
+  signalTyping(els.chatInput.value.trim().length > 0);
+});
+els.chatInput.addEventListener('blur', () => signalTyping(false));
+
+function signalTyping(typing) {
+  if (typing) {
+    if (!state.typingSent) { state.typingSent = true; state.socket?.emit('typing', { typing: true }); }
+    clearTimeout(state.typingTimer);
+    state.typingTimer = setTimeout(() => signalTyping(false), 3000);
+  } else if (state.typingSent) {
+    state.typingSent = false;
+    clearTimeout(state.typingTimer);
+    state.socket?.emit('typing', { typing: false });
+  }
+}
+
 els.reactions.forEach((btn) => {
-  btn.addEventListener('click', () => sendChat(btn.dataset.emoji));
+  btn.addEventListener('click', () => {
+    state.socket.emit('reaction', { emoji: btn.dataset.emoji });
+  });
 });
 
 function sendChat(text) {
@@ -349,14 +492,21 @@ function renderMessageBody(text) {
   return frag;
 }
 
-function appendChat(msg) {
+function isNearBottom(el) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+}
+
+function appendChat(msg, opts = {}) {
+  const stick = isNearBottom(els.chatLog);
+  const mine = msg.clientId ? msg.clientId === state.clientId : msg.socketId === state.socket?.id;
   const node = document.createElement('div');
-  node.className = 'chat-msg' + (msg.socketId === state.socket?.id ? ' self' : '');
+  node.className = 'chat-msg' + (mine ? ' self' : '');
   const meta = document.createElement('div');
   meta.className = 'meta';
   const nick = document.createElement('span');
   nick.className = 'nick';
   nick.textContent = msg.nickname;
+  if (msg.color && !mine) nick.style.color = msg.color;
   const time = document.createElement('span');
   time.className = 'time';
   time.textContent = formatTime(msg.ts);
@@ -367,25 +517,34 @@ function appendChat(msg) {
   body.appendChild(renderMessageBody(msg.text));
   node.appendChild(body);
   els.chatLog.appendChild(node);
-  els.chatLog.scrollTop = els.chatLog.scrollHeight;
-  notifyChat(msg);
+  if (stick) els.chatLog.scrollTop = els.chatLog.scrollHeight;
+  if (!opts.history) notifyChat(msg, mine);
 }
 
 function appendSystem(msg) {
+  const stick = isNearBottom(els.chatLog);
   const node = document.createElement('div');
   node.className = 'chat-msg system';
   node.textContent = msg.text;
   els.chatLog.appendChild(node);
+  if (stick) els.chatLog.scrollTop = els.chatLog.scrollHeight;
+}
+
+function renderChatHistory(history) {
+  els.chatLog.innerHTML = '';
+  for (const entry of history) {
+    if (entry.kind === 'system') appendSystem(entry);
+    else appendChat(entry, { history: true });
+  }
   els.chatLog.scrollTop = els.chatLog.scrollHeight;
 }
 
 function formatTime(ts) {
-  const d = new Date(ts);
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-function notifyChat(msg) {
-  if (msg.socketId === state.socket?.id) return;
+function notifyChat(msg, mine) {
+  if (mine) return;
   const chatTabActive = state.activeTab === 'chat' && !document.hidden;
   if (chatTabActive) return;
   state.unread++;
@@ -411,51 +570,125 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden && state.activeTab === 'chat') clearUnread();
 });
 
+// ---------- typing indicator ----------
+function onTyping(payload) {
+  if (!payload || payload.clientId === state.clientId) return;
+  if (payload.typing) {
+    state.typers.set(payload.clientId, payload.nickname);
+    // Auto-expire stale typing flags if no "stop" arrives.
+    clearTimeout(state.typers.get(`${payload.clientId}:t`));
+    const tid = setTimeout(() => { state.typers.delete(payload.clientId); renderTyping(); }, 5000);
+    state.typers.set(`${payload.clientId}:t`, tid);
+  } else {
+    clearTimeout(state.typers.get(`${payload.clientId}:t`));
+    state.typers.delete(`${payload.clientId}:t`);
+    state.typers.delete(payload.clientId);
+  }
+  renderTyping();
+}
+
+function renderTyping() {
+  const names = [...state.typers.entries()]
+    .filter(([k]) => !k.endsWith(':t'))
+    .map(([, v]) => v);
+  if (!names.length) { els.typingIndicator.textContent = ''; els.typingIndicator.classList.remove('active'); return; }
+  let text;
+  if (names.length === 1) text = `${names[0]} is typing…`;
+  else if (names.length === 2) text = `${names[0]} and ${names[1]} are typing…`;
+  else text = 'Several people are typing…';
+  els.typingIndicator.textContent = text;
+  els.typingIndicator.classList.add('active');
+}
+
+// ---------- floating reactions ----------
+function showReaction(payload) {
+  if (!payload?.emoji) return;
+  const el = document.createElement('div');
+  el.className = 'floating-reaction';
+  el.textContent = payload.emoji;
+  // Spread launch position across the lower band of the player.
+  el.style.left = `${10 + Math.random() * 80}%`;
+  el.style.setProperty('--drift', `${(Math.random() * 60 - 30).toFixed(0)}px`);
+  const label = document.createElement('span');
+  label.className = 'reaction-name';
+  label.textContent = payload.nickname || '';
+  if (payload.color) label.style.color = payload.color;
+  el.appendChild(label);
+  els.reactionLayer.appendChild(el);
+  el.addEventListener('animationend', () => el.remove());
+  setTimeout(() => el.remove(), 3000);
+}
+
 // ---------- queue / users ----------
 function renderQueue(queue) {
   els.queueCount.textContent = queue.length;
+  els.queueEmpty.classList.toggle('hidden', queue.length > 0);
   els.queueList.innerHTML = '';
+  const editable = state.isHost || !state.locked;
   queue.forEach((item, idx) => {
     const li = document.createElement('li');
     li.className = 'queue-item';
+    const pos = document.createElement('span');
+    pos.className = 'queue-pos';
+    pos.textContent = idx + 1;
+    li.appendChild(pos);
     const title = document.createElement('span');
     title.className = 'title';
     title.textContent = item.title || item.source;
+    title.title = item.source;
     li.appendChild(title);
-    const btn = document.createElement('button');
-    btn.title = 'Remove';
-    btn.textContent = '×';
-    btn.addEventListener('click', () => state.socket.emit('queue_remove', { index: idx }));
-    li.appendChild(btn);
+    const actions = document.createElement('span');
+    actions.className = 'queue-actions';
+    if (editable) {
+      if (idx > 0) actions.appendChild(queueBtn('↑', 'Move up', () => state.socket.emit('queue_move', { from: idx, to: idx - 1 })));
+      if (idx < queue.length - 1) actions.appendChild(queueBtn('↓', 'Move down', () => state.socket.emit('queue_move', { from: idx, to: idx + 1 })));
+      actions.appendChild(queueBtn('×', 'Remove', () => state.socket.emit('queue_remove', { index: idx }), 'danger'));
+    }
+    li.appendChild(actions);
     els.queueList.appendChild(li);
   });
 }
 
+function queueBtn(label, title, onClick, cls = '') {
+  const b = document.createElement('button');
+  b.textContent = label;
+  b.title = title;
+  if (cls) b.className = cls;
+  b.addEventListener('click', onClick);
+  return b;
+}
+
 function renderUsers(users) {
-  els.userCount.textContent = users.length;
+  els.userCount.textContent = users.filter((u) => !u.disconnected).length;
   els.userList.innerHTML = '';
   users.forEach((u) => {
     const li = document.createElement('li');
-    li.className = 'user-item';
+    li.className = 'user-item' + (u.disconnected ? ' offline' : '');
+    const left = document.createElement('span');
+    left.className = 'user-name';
+    const dot = document.createElement('span');
+    dot.className = 'user-dot';
+    dot.style.background = u.color || 'var(--accent)';
+    left.appendChild(dot);
     const name = document.createElement('span');
-    name.textContent = u.nickname + (u.socketId === state.socket?.id ? ' (you)' : '');
-    li.appendChild(name);
+    name.textContent = u.nickname + (u.clientId === state.clientId ? ' (you)' : '');
+    left.appendChild(name);
+    li.appendChild(left);
     const right = document.createElement('span');
-    if (u.buffering) {
-      const b = document.createElement('span');
-      b.className = 'buffer-pill';
-      b.textContent = 'buffering';
-      right.appendChild(b);
-    }
-    if (u.isHost) {
-      const h = document.createElement('span');
-      h.className = 'host-pill';
-      h.textContent = 'HOST';
-      right.appendChild(h);
-    }
+    right.className = 'user-tags';
+    if (u.disconnected) right.appendChild(pill('away', 'away-pill'));
+    if (u.buffering) right.appendChild(pill('buffering', 'buffer-pill'));
+    if (u.isHost) right.appendChild(pill('HOST', 'host-pill'));
     li.appendChild(right);
     els.userList.appendChild(li);
   });
+}
+
+function pill(text, cls) {
+  const s = document.createElement('span');
+  s.className = cls;
+  s.textContent = text;
+  return s;
 }
 
 // ---------- tabs ----------
@@ -466,7 +699,10 @@ els.tabs.forEach((tab) => {
     tab.classList.add('active');
     document.querySelector(`[data-tab-panel="${tab.dataset.tab}"]`).classList.add('active');
     state.activeTab = tab.dataset.tab;
-    if (state.activeTab === 'chat') clearUnread();
+    if (state.activeTab === 'chat') {
+      clearUnread();
+      els.chatLog.scrollTop = els.chatLog.scrollHeight;
+    }
   });
 });
 

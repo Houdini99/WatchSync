@@ -1,4 +1,8 @@
-const YT_HOSTS = new Set(['youtu.be', 'www.youtu.be', 'youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com']);
+const YT_HOSTS = new Set([
+  'youtu.be', 'www.youtu.be', 'youtube.com', 'www.youtube.com',
+  'm.youtube.com', 'music.youtube.com',
+  'youtube-nocookie.com', 'www.youtube-nocookie.com',
+]);
 
 const TITLE_CACHE_MAX = 500;
 const TITLE_FETCH_TIMEOUT_MS = 3000;
@@ -14,7 +18,15 @@ export function detectMedia(rawUrl) {
 
   if (YT_HOSTS.has(url.hostname)) {
     const id = extractYouTubeId(url);
-    if (id) return { type: 'youtube', id, source: rawUrl, title: cachedYouTubeTitle(id) || rawUrl };
+    if (id) {
+      return {
+        type: 'youtube',
+        id,
+        source: rawUrl,
+        start: extractStartSeconds(url),
+        title: cachedYouTubeTitle(id) || rawUrl,
+      };
+    }
   }
 
   const pathname = url.pathname.toLowerCase();
@@ -22,6 +34,17 @@ export function detectMedia(rawUrl) {
   if (/\.(mp4|webm|ogg|mov|mkv)$/.test(pathname)) return { type: 'file', source: rawUrl, title: prettyTitle(url) };
 
   return { type: 'file', source: rawUrl, title: prettyTitle(url) };
+}
+
+// Honor ?t=90 / ?t=1m30s / ?start=90 so a deep-link starts where it points.
+function extractStartSeconds(url) {
+  const raw = url.searchParams.get('t') || url.searchParams.get('start');
+  if (!raw) return 0;
+  if (/^\d+$/.test(raw)) return Math.min(Number(raw), 86400);
+  const m = raw.match(/(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?/i);
+  if (!m) return 0;
+  const secs = (Number(m[1]) || 0) * 3600 + (Number(m[2]) || 0) * 60 + (Number(m[3]) || 0);
+  return Math.min(secs, 86400);
 }
 
 // Resolve missing titles in the background. Mutates the media object's title

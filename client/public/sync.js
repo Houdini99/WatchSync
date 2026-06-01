@@ -4,6 +4,8 @@
 const DRIFT_TOLERANCE = 1.5;
 const LOCAL_ACTION_GRACE_MS = 2000;
 const BUFFER_DEBOUNCE_MS = 500;
+const LOAD_SETTLE_MS = 1500;
+const READY_TAIL_MS = 800;
 
 export class SyncEngine extends EventTarget {
   constructor(socket) {
@@ -17,6 +19,11 @@ export class SyncEngine extends EventTarget {
     this._bufferTimer = null;
     this._bufferState = false;
     this._mySocketId = null;
+    // While a freshly loaded player seeks/autoplays into position it fires
+    // play/seek/rate events that are NOT user intent. Suppress *outgoing*
+    // intents until things settle, or a late joiner's autoplay-at-0 echo would
+    // clobber the room's real position. Incoming sync still applies normally.
+    this._suspendOutgoingUntil = 0;
 
     socket.on('connect', () => { this._mySocketId = socket.id; });
     socket.on('heartbeat', (state) => this.onHeartbeat(state));
@@ -45,27 +52,45 @@ export class SyncEngine extends EventTarget {
     this.media = media;
     this._cancelBufferTimer();
     this._bufferState = false;
+    // Suspend outgoing intents while the new player loads and seeks into place.
+    this._suspendOutgoingUntil = Date.now() + LOAD_SETTLE_MS;
+    // Extend the window a little past "ready" to cover the post-ready seek/play
+    // echo on slow loads (esp. YouTube, where ready can take a second or two).
+    const onReady = () => {
+      player.events.removeEventListener('ready', onReady);
+      this._suspendOutgoingUntil = Math.max(this._suspendOutgoingUntil, Date.now() + READY_TAIL_MS);
+    };
+    player.events.addEventListener('ready', onReady);
     this._bindPlayer(player);
   }
 
   _markLocalChange() { this._lastLocalChange = Date.now(); }
   _inLocalGrace() { return Date.now() - this._lastLocalChange < LOCAL_ACTION_GRACE_MS; }
+  _outgoingSuspended() { return Date.now() < this._suspendOutgoingUntil; }
   _cancelBufferTimer() {
     if (this._bufferTimer) { clearTimeout(this._bufferTimer); this._bufferTimer = null; }
   }
 
   _bindPlayer(player) {
     player.events.addEventListener('play', (e) => {
+      if (this._outgoingSuspended()) return;
       this._markLocalChange();
       this.socket.emit('play_pause', { paused: false, currentTime: e.detail.currentTime });
     });
     player.events.addEventListener('pause', (e) => {
+      if (this._outgoingSuspended()) return;
       this._markLocalChange();
       this.socket.emit('play_pause', { paused: true, currentTime: e.detail.currentTime });
     });
     player.events.addEventListener('seek', (e) => {
+      if (this._outgoingSuspended()) return;
       this._markLocalChange();
       this.socket.emit('seek', { currentTime: e.detail.currentTime });
+    });
+    player.events.addEventListener('ratechange', (e) => {
+      if (this._outgoingSuspended()) return;
+      this._markLocalChange();
+      this.socket.emit('set_rate', { rate: e.detail.rate });
     });
     player.events.addEventListener('buffering', (e) => {
       const buffering = !!e.detail.buffering;
@@ -93,7 +118,11 @@ export class SyncEngine extends EventTarget {
     if (this._inLocalGrace()) {
       // Mid local action: respect pause flips initiated by others, but DON'T trust their position.
       if (this.player.isPaused() !== state.video.paused) {
-        this.player.applyState({ currentTime: this.player.getTime(), paused: state.video.paused });
+        this.player.applyState({
+          currentTime: this.player.getTime(),
+          paused: state.video.paused,
+          rate: state.video.rate,
+        });
       }
       return;
     }
@@ -104,28 +133,25 @@ export class SyncEngine extends EventTarget {
     if (!this.player) return;
     if (this._inLocalGrace()) return;
     if (this.player.isSeeking?.()) return;
-    const live = state.currentTime + (state.paused ? 0 : this.latencyMs / 1000);
+    const rate = state.rate || 1;
+    const live = state.currentTime + (state.paused ? 0 : (this.latencyMs / 1000) * rate);
     const diff = Math.abs(this.player.getTime() - live);
-    if (diff > DRIFT_TOLERANCE) {
-      this.player.applyState({ currentTime: live, paused: state.paused });
-    } else if (this.player.isPaused() !== state.paused) {
-      this.player.applyState({ currentTime: live, paused: state.paused });
+    const rateOff = Math.abs((this.player.getRate?.() ?? 1) - rate) > 0.001;
+    if (diff > DRIFT_TOLERANCE || this.player.isPaused() !== state.paused || rateOff) {
+      this.player.applyState({ currentTime: live, paused: state.paused, rate });
     }
   }
 
   _apply(videoState) {
-    const live = videoState.currentTime + (videoState.paused ? 0 : this.latencyMs / 1000);
-    this.player.applyState({ currentTime: live, paused: videoState.paused });
+    const rate = videoState.rate || 1;
+    const live = videoState.currentTime + (videoState.paused ? 0 : (this.latencyMs / 1000) * rate);
+    this.player.applyState({ currentTime: live, paused: videoState.paused, rate });
   }
 
   // Public: apply a state explicitly (used right after media load on join).
   applyInitial(videoState) {
     if (!this.player || !videoState) return;
-    const apply = () => {
-      const live = videoState.currentTime + (videoState.paused ? 0 : this.latencyMs / 1000);
-      this.player.applyState({ currentTime: live, paused: videoState.paused });
-    };
-    // If the player isn't ready yet (no metadata), wait for it.
+    const apply = () => this._apply(videoState);
     const ready = () => {
       this.player.events.removeEventListener('ready', ready);
       apply();
