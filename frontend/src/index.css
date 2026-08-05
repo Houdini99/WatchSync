@@ -1,0 +1,154 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Theme tokens — flipped by the data-theme attribute on <html>. Tailwind colors
+   in tailwind.config.js resolve to these variables. */
+:root,
+:root[data-theme='dark'] {
+  --bg: #0d0f14;
+  --bg-elev: #161a22;
+  --bg-elev-2: #1e2330;
+  --border: #2a3142;
+  --text: #e6e9ef;
+  --text-dim: #8b93a7;
+  --accent: #6366f1;
+  --accent-hover: #7c7ff5;
+  --danger: #ef4444;
+  --success: #22c55e;
+  --warn: #fbbf24;
+  --shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+:root[data-theme='light'] {
+  --bg: #f4f5f8;
+  --bg-elev: #ffffff;
+  --bg-elev-2: #eceef3;
+  --border: #d6dae3;
+  --text: #1a1d26;
+  --text-dim: #5c6577;
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --danger: #dc2626;
+  --success: #16a34a;
+  --warn: #d97706;
+  --shadow: 0 8px 32px rgba(20, 30, 60, 0.12);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  transition: background 0.2s, color 0.2s;
+}
+
+/* The room view manages its own scrolling; the landing page centers content. */
+body.room-open {
+  overflow: hidden;
+}
+
+/* Raw <video> / YouTube mount inside the player surface. Both are positioned
+   absolutely so they overlay (never stack) — visibility is owned by React via
+   inline `display`, so nothing here may force `display`, or it would override
+   the inline value and leave a ghost player visible. */
+.player-surface > video,
+.player-surface > .yt-mount {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.player-surface > video {
+  object-fit: contain;
+  background: #000;
+}
+.player-surface .yt-mount iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+/* When the host has locked controls for a non-host viewer. */
+.locked-controls video::-webkit-media-controls {
+  display: none !important;
+}
+.locked-controls video,
+.locked-controls .yt-mount {
+  pointer-events: none;
+}
+
+/* Floating emoji reactions. */
+.floating-reaction {
+  position: absolute;
+  bottom: 8%;
+  font-size: 2.4rem;
+  line-height: 1;
+  text-align: center;
+  will-change: transform, opacity;
+  animation: floatUp 2.8s ease-out forwards;
+  filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.5));
+}
+.floating-reaction .reaction-name {
+  display: block;
+  font-size: 0.7rem;
+  color: #fff;
+  margin-top: 2px;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+}
+@keyframes floatUp {
+  0% {
+    transform: translateY(0) translateX(0) scale(0.5);
+    opacity: 0;
+  }
+  15% {
+    transform: translateY(-10%) scale(1.15);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(-320px) translateX(var(--drift, 0)) scale(1);
+    opacity: 0;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spinning {
+  animation: spin 0.6s linear infinite;
+}
+
+/* Thin scrollbars. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .floating-reaction {
+    animation-duration: 0.01s;
+    opacity: 0;
+  }
+  .spinning {
+    animation: none;
+  }
+}

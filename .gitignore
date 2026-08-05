@@ -1,0 +1,27 @@
+# Rust
+/backend/target
+
+# Local dev accounts database (default DATABASE_PATH=data/watchsync.db)
+/backend/data
+
+# Node
+/frontend/node_modules
+/frontend/dist
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Env / local
+.env
+*.local
+
+# Local planning notes — not part of the shipped project
+/Plan.md
+
+# Editor / OS / tooling
+.DS_Store
+.vscode
+.idea
+.claude/settings.local.json

@@ -1,27 +1,130 @@
+# WatchSync — Portainer-friendly stack.
+#
+# Four containers on a shared, pre-existing external network named `proxy`.
+# Only the first is reachable from the edge; the rest are internal:
+#   • watchsync-client   — Nginx serving the React build; reverse-proxies
+#                          /api and /ws to the server (so your edge proxy only
+#                          needs to point at this one container).
+#   • watchsync-server   — the Rust sync engine (in-memory room state) plus the
+#                          per-room ffmpeg → HLS proxy and the SQLite accounts DB.
+#   • watchsync-resolver — yt-dlp sidecar: page URL → stream URLs + subtitles.
+#   • watchsync-bgutil   — PO-token provider for YouTube caption attestation.
+#
+# This file deliberately declares no `build:` contexts, so it can be pasted
+# straight into Portainer's web editor. Build the three first-party images on
+# the host once, then deploy — the `image:` tags below match:
+#   docker build -t watchsync-server:latest   ./backend
+#   docker build -t watchsync-client:latest   ./frontend
+#   docker build -t watchsync-resolver:latest ./resolver
+#   docker compose up -d
+# (watchsync-bgutil is pulled from Docker Hub.)
+#
+# No new network is created here; every service joins the external `proxy`
+# network your reverse proxy (NPM/Traefik/Caddy) already lives on. No host
+# bind-mounts are used, so it transplants cleanly into Portainer — the shared
+# state is the two named volumes at the bottom: `watchsync-streams` (tmpfs,
+# scratch) and `watchsync-data` (durable, the accounts database).
+
 services:
   watchsync-server:
     image: watchsync-server:latest
-    pull_policy: never
     container_name: watchsync-server
     restart: unless-stopped
     environment:
-      - NODE_ENV=production
-      - PORT=3000
       - HOST=0.0.0.0
+      - PORT=3000
       # Lock this to your public https origin in production. "*" reflects any
       # origin (fine for testing). Comma-separate to allow several.
       - CORS_ORIGIN=${PUBLIC_ORIGIN:-*}
-      - LOG_LEVEL=${LOG_LEVEL:-info}
-      # Optional tunables (defaults shown in server/src/config.js):
+      - RUST_LOG=${LOG_LEVEL:-info}
+      # yt-dlp resolver sidecar (Vimeo/Twitch/Reddit/…). Set to "" to disable —
+      # /api/resolve then returns 501 and non-native links are best-effort only.
+      - RESOLVER_URL=${RESOLVER_URL:-http://watchsync-resolver:8080}
+      # Allow pasting media URLs that resolve to private/LAN addresses (your
+      # Jellyfin, a NAS, …). Off by default: on a public instance this is an
+      # SSRF hole into the Docker network. Applies to server and resolver alike.
+      - ALLOW_PRIVATE_URLS=${ALLOW_PRIVATE_URLS:-false}
+      # Optional accounts (SQLite on the watchsync-data volume below). Guests
+      # need nothing; registering unlocks persistent custom room URLs.
+      - DATABASE_PATH=/data/watchsync.db
+      # Set to "false" to close signups (existing accounts keep working).
+      - REGISTRATION_ENABLED=${REGISTRATION_ENABLED:-true}
+      # Max custom room names one account may hold.
+      - MAX_ROOMS_PER_USER=${MAX_ROOMS_PER_USER:-5}
+      # Session cookie is HTTPS-only by default; set "false" only for a
+      # plain-HTTP LAN install (no reverse proxy / no TLS).
+      - COOKIE_SECURE=${COOKIE_SECURE:-true}
+      # Optional tunables — uncomment to override. Values below are the actual
+      # defaults from backend/src/config.rs:
       # - MAX_USERS_PER_ROOM=50
+      # - MAX_ROOMS=5000
+      # - MAX_QUEUE_LENGTH=200
       # - EMPTY_ROOM_TTL_MS=300000
       # - RECONNECT_GRACE_MS=12000
+      # - HEARTBEAT_MS=4000
+      # - DRIFT_TOLERANCE_SEC=1.5
       # - CHAT_HISTORY_LIMIT=80
-      # - ALLOWED_RATES=0.5,1,1.25,1.5,2
+      # - SESSION_TTL_DAYS=30
+      # - ALLOWED_RATES=0.25,0.5,0.75,1,1.25,1.5,1.75,2
+      # - HLS_SEGMENT_SEC=4
+      # - STREAM_AUDIO_BITRATE=192k
+      # - STREAM_READY_TIMEOUT_SEC=30
+    depends_on:
+      watchsync-resolver:
+        condition: service_started
+    networks:
+      - proxy
+    # The on-the-fly HLS proxy writes /dev/shm/streams/{room}/… here and Nginx
+    # in watchsync-client serves the same files directly — the volume MUST be
+    # mounted in both containers or every non-YouTube stream 404s.
+    volumes:
+      - watchsync-streams:/dev/shm/streams
+      # Accounts + registered room names (SQLite). Plain local volume — unlike
+      # the streams tmpfs this must survive restarts. Back up by copying the
+      # one .db file inside.
+      - watchsync-data:/data
+    healthcheck:
+      # 127.0.0.1, not localhost: avoids an IPv6 (::1) lookup the server doesn't bind.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Internal-only: turns Vimeo/Twitch/Reddit/… page URLs into direct streams via
+  # yt-dlp. Reached only by watchsync-server over the Docker network — there is
+  # no edge route to it.
+  watchsync-resolver:
+    image: watchsync-resolver:latest
+    container_name: watchsync-resolver
+    restart: unless-stopped
+    environment:
+      # PO-token provider used for YouTube subtitle extraction (see
+      # watchsync-bgutil below). Set to "" to disable — subtitle listing still
+      # works, but auto-translated tracks lose their attestation tokens and
+      # will usually be rejected by YouTube.
+      - POT_PROVIDER_URL=${POT_PROVIDER_URL:-http://watchsync-bgutil:4416}
+      # Same SSRF policy as the server (yt-dlp fetches user-pasted URLs).
+      - ALLOW_PRIVATE_URLS=${ALLOW_PRIVATE_URLS:-false}
+      # Optional tunables (defaults from resolver/app.py):
+      # - RESOLVE_TIMEOUT=20     # per-extraction socket timeout, seconds
+      # - SUBS_CACHE_TTL=900     # subtitle-track metadata cache, seconds
+    networks:
+      - proxy
+
+  # Internal-only: mints YouTube "PO tokens" (BotGuard attestation) for the
+  # resolver's subtitle extraction. YouTube requires these on caption requests
+  # for auto-translated languages; without them viewers' browsers get 429s.
+  watchsync-bgutil:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: watchsync-bgutil
+    restart: unless-stopped
     networks:
       - proxy
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      # Node image (no python inside); the provider listens on 4416 and its
+      # health endpoint is GET /ping.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4416/ping').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -29,7 +132,6 @@ services:
 
   watchsync-client:
     image: watchsync-client:latest
-    pull_policy: never
     container_name: watchsync-client
     restart: unless-stopped
     depends_on:
@@ -37,8 +139,14 @@ services:
         condition: service_started
     networks:
       - proxy
+    # Read side of the shared RAM disk: nginx.conf aliases /api/streams/ to
+    # /dev/shm/streams/ and serves the playlists/segments with no upstream hop.
+    volumes:
+      - watchsync-streams:/dev/shm/streams
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:80/"]
+      # 127.0.0.1, not localhost: busybox wget won't fall back from IPv6 (::1)
+      # to IPv4, and nginx listens on IPv4 only.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -46,3 +154,24 @@ services:
 networks:
   proxy:
     external: true
+
+volumes:
+  # RAM-backed scratch space for the per-room HLS proxy, shared between the
+  # server (ffmpeg writes) and the client (nginx reads). tmpfs so segments never
+  # touch disk; sized because a proxied VOD is kept in full until the room ends
+  # (a 2h 1080p remux can reach a few GB — raise STREAMS_TMPFS_SIZE if you watch
+  # long/high-bitrate files). mode=1777 (like /dev/shm) because the server runs
+  # as uid 10001 and nginx reads as uid 101.
+  # NOTE: driver_opts are frozen at first creation. To change the size later:
+  #   docker compose -p watchsync down && docker volume rm watchsync_watchsync-streams
+  watchsync-streams:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=${STREAMS_TMPFS_SIZE:-2g},mode=1777"
+
+  # Durable home of the accounts database (users, sessions, registered room
+  # names). Deleting this volume deletes every account and claimed room URL.
+  watchsync-data:
+    driver: local
