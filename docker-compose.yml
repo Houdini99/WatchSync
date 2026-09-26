@@ -1,7 +1,8 @@
 # WatchSync — Portainer-friendly stack.
 #
-# Four containers on a shared, pre-existing external network named `proxy`.
-# Only the first is reachable from the edge; the rest are internal:
+# Four containers. Only the first joins your pre-existing external `proxy`
+# network and is reachable from the edge; the other three sit on the private
+# `watchsync-internal` network defined at the bottom:
 #   • watchsync-client   — Nginx serving the React build; reverse-proxies
 #                          /api and /ws to the server (so your edge proxy only
 #                          needs to point at this one container).
@@ -19,9 +20,9 @@
 #   docker compose up -d
 # (watchsync-bgutil is pulled from Docker Hub.)
 #
-# No new network is created here; every service joins the external `proxy`
-# network your reverse proxy (NPM/Traefik/Caddy) already lives on. No host
-# bind-mounts are used, so it transplants cleanly into Portainer — the shared
+# The only network created here is `watchsync-internal`; the external `proxy`
+# network your reverse proxy (NPM/Traefik/Caddy) lives on must already exist.
+# No host bind-mounts are used, so it transplants cleanly into Portainer — the shared
 # state is the two named volumes at the bottom: `watchsync-streams` (tmpfs,
 # scratch) and `watchsync-data` (durable, the accounts database).
 
