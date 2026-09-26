@@ -15,7 +15,7 @@
 //!   3. A monotonic generation guards every async callback so a superseded
 //!      ffmpeg can never report ready/exit against a newer stream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +23,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tokio::process::{Child, Command};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, ChildStderr, Command};
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::{sleep, Instant};
 
@@ -35,6 +36,10 @@ use crate::state::AppState;
 const PLAYLIST_NAME: &str = "index.m3u8";
 const SEGMENT_PATTERN: &str = "seg_%05d.ts";
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// ffmpeg stderr lines kept for the log. At `-loglevel warning` a healthy run
+/// prints nothing, and a failing one says why in its last few lines.
+const STDERR_TAIL_LINES: usize = 20;
+const STDERR_LINE_MAX: usize = 300;
 
 /// The inputs ffmpeg should mux. Either a single combined source (direct file,
 /// HLS, or an already-muxed resolver result) or a separate video + audio pair.
@@ -67,6 +72,7 @@ struct Session {
 pub struct StreamManager {
     dir: PathBuf,
     hls_segment_sec: u32,
+    max_bytes: u64,
     audio_bitrate: String,
     ready_timeout: Duration,
     next_gen: AtomicU64,
@@ -79,10 +85,12 @@ impl StreamManager {
         hls_segment_sec: u32,
         audio_bitrate: String,
         ready_timeout_sec: u64,
+        max_bytes: u64,
     ) -> Self {
         StreamManager {
             dir,
             hls_segment_sec: hls_segment_sec.max(1),
+            max_bytes,
             audio_bitrate,
             ready_timeout: Duration::from_secs(ready_timeout_sec.max(1)),
             next_gen: AtomicU64::new(0),
@@ -118,7 +126,22 @@ impl StreamManager {
         let room_dir = self.dir.join(&room_id);
         let mut cmd = self.build_command(&room_dir, offset, &source, live);
 
+        // LOCK ORDER: `sessions` then `rooms`, never the reverse. Every
+        // streams.stop() call site drops the rooms guard before calling in, so
+        // this direction is the one the codebase already relies on -- keep it.
         let mut sessions = self.sessions.lock().await;
+
+        // Re-check the generation while HOLDING `sessions`. The check at the
+        // top of this fn is not enough: between it and the insert below, a reap
+        // could run stop(), find no session to kill, wipe the directory, and
+        // drop the room -- after which this spawn would create a child with no
+        // session record and no room, so nothing would ever kill it. It then
+        // transcodes into the shared tmpfs until ENOSPC takes out every other
+        // room's ffmpeg too.
+        if current_generation_is(&state, &room_id, generation).await != Some(true) {
+            return;
+        }
+
         // Another spawn already owns this room with an equal/newer generation.
         if let Some(existing) = sessions.get(&room_id) {
             if existing.generation >= generation {
@@ -131,16 +154,32 @@ impl StreamManager {
                 let _ = tx.send(());
             }
         }
-        // Fresh, empty room dir on the RAM disk. (tmpfs ops are ~instant.)
-        let _ = std::fs::remove_dir_all(&room_dir);
-        if let Err(e) = std::fs::create_dir_all(&room_dir) {
-            drop(sessions);
-            tracing::error!("stream {room_id}: failed to create {room_dir:?}: {e}");
-            mark_error(&state, &room_id, generation).await;
-            return;
+        // Fresh, empty room dir on the RAM disk. tmpfs ops are fast, but an
+        // event playlist can hold thousands of segments, so the unlink walk
+        // goes to the blocking pool rather than stalling a runtime worker.
+        let dir_for_reset = room_dir.clone();
+        let reset = tokio::task::spawn_blocking(move || {
+            let _ = std::fs::remove_dir_all(&dir_for_reset);
+            std::fs::create_dir_all(&dir_for_reset)
+        })
+        .await;
+        match reset {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                drop(sessions);
+                tracing::error!("stream {room_id}: failed to create {room_dir:?}: {e}");
+                mark_error(&state, &room_id, generation).await;
+                return;
+            }
+            Err(e) => {
+                drop(sessions);
+                tracing::error!("stream {room_id}: room dir reset task failed: {e}");
+                mark_error(&state, &room_id, generation).await;
+                return;
+            }
         }
 
-        let child = match cmd.spawn() {
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 drop(sessions);
@@ -150,6 +189,7 @@ impl StreamManager {
             }
         };
         tracing::info!("stream {room_id}: ffmpeg gen={generation} offset={offset:.1}s live={live}");
+        let stderr_tail = child.stderr.take().map(collect_stderr_tail);
 
         let (kill_tx, kill_rx) = oneshot::channel();
         sessions.insert(
@@ -163,9 +203,33 @@ impl StreamManager {
 
         // Supervisor owns the child (reaps + explicit kill). Readiness poller
         // flips the room to ready once the playlist lands.
-        tokio::spawn(supervise(child, kill_rx, state.clone(), room_id.clone(), generation));
+        tokio::spawn(supervise(
+            child,
+            kill_rx,
+            stderr_tail,
+            room_dir.clone(),
+            state.clone(),
+            room_id.clone(),
+            generation,
+        ));
         let playlist = room_dir.join(PLAYLIST_NAME);
         tokio::spawn(poll_ready(playlist, state, room_id, generation, self.ready_timeout));
+    }
+
+    /// Kill every live ffmpeg child. Used on shutdown so children are not
+    /// orphaned to init when the process goes away (see the call site in
+    /// `main`). Directories are left alone — the next boot wipes the tmpfs.
+    pub async fn stop_all(&self) {
+        let mut sessions = self.sessions.lock().await;
+        let count = sessions.len();
+        for (_room, mut session) in sessions.drain() {
+            if let Some(tx) = session.kill.take() {
+                let _ = tx.send(());
+            }
+        }
+        if count > 0 {
+            tracing::info!("stopped {count} ffmpeg child(ren) on shutdown");
+        }
     }
 
     /// Kill the room's ffmpeg (if any) and wipe its RAM-disk directory.
@@ -195,11 +259,23 @@ impl StreamManager {
             .kill_on_drop(true)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // Piped and drained into a short tail for the log (see
+            // collect_stderr_tail). It used to go to /dev/null, so no ffmpeg
+            // failure — a 403 from the origin, a codec it cannot remux — ever
+            // reached `docker logs`, which the README tells operators to read.
+            .stderr(Stdio::piped())
             .arg("-nostdin")
             .arg("-hide_banner")
             .arg("-loglevel")
             .arg("warning")
+            // Pin the protocols ffmpeg may use. Inputs here are user-pasted or
+            // resolver-derived, and an .m3u8 can name arbitrary sub-resources;
+            // without this an attacker-authored playlist can reach `file:` and
+            // read the container filesystem back into the room's stream.
+            // `file` stays in the list because the HLS muxer writes segments
+            // through it; `crypto`/`data` are needed for encrypted HLS.
+            .arg("-protocol_whitelist")
+            .arg("file,crypto,data,http,https,tcp,tls,httpproxy")
             .arg("-y");
 
         add_input(&mut cmd, offset, &source.video_url, &source.video_headers);
@@ -243,12 +319,19 @@ impl StreamManager {
                 .arg("independent_segments+delete_segments");
         } else {
             // Finite media: an event playlist keeps every segment, so the room's
-            // whole timeline stays seekable off the (size-capped) RAM disk.
+            // whole timeline stays seekable off the RAM disk.
             cmd.arg("-hls_playlist_type")
                 .arg("event")
                 .arg("-hls_flags")
                 .arg("independent_segments");
         }
+        // Per-room byte budget. The old comment called the RAM disk
+        // "size-capped", but the only cap was the whole shared volume
+        // (STREAMS_TMPFS_SIZE, default 2g) -- with an event playlist keeping
+        // every segment and no -fs/-t, one long high-bitrate video filled it
+        // and every OTHER room's ffmpeg then died with ENOSPC. -fs stops this
+        // room's writer at its own ceiling instead.
+        cmd.arg("-fs").arg(self.max_bytes.to_string());
         cmd.arg(PLAYLIST_NAME);
         cmd
     }
@@ -258,15 +341,26 @@ impl StreamManager {
 /// Order matters: all of these are *input* options and must precede `-i`.
 fn add_input(cmd: &mut Command, offset: f64, url: &str, headers: &[(String, String)]) {
     if !headers.is_empty() {
-        // ffmpeg wants CRLF-separated "Key: Value" lines in a single arg.
+        // ffmpeg wants CRLF-separated "Key: Value" lines in a single arg — so a
+        // \r or \n inside a key or value injects extra headers into ffmpeg's
+        // outbound request. These pairs come from the resolver, i.e. from
+        // yt-dlp's extraction of a user-pasted page, so they are not trusted.
+        // Drop any pair containing a control character rather than silently
+        // sanitizing it: a header that needs one is a header we should not send.
         let mut blob = String::new();
         for (k, v) in headers {
+            if has_control_chars(k) || has_control_chars(v) || k.is_empty() {
+                tracing::warn!("dropping stream header with control characters: {k:?}");
+                continue;
+            }
             blob.push_str(k);
             blob.push_str(": ");
             blob.push_str(v);
             blob.push_str("\r\n");
         }
-        cmd.arg("-headers").arg(blob);
+        if !blob.is_empty() {
+            cmd.arg("-headers").arg(blob);
+        }
     }
     // Survive transient drops on signed CDN URLs (http/https inputs only).
     if url.starts_with("http") {
@@ -286,11 +380,87 @@ fn add_input(cmd: &mut Command, offset: f64, url: &str, headers: &[(String, Stri
     cmd.arg("-i").arg(url);
 }
 
+/// Drain ffmpeg's stderr — an undrained pipe blocks the child once it fills —
+/// keeping the last few lines for the log.
+fn collect_stderr_tail(stderr: ChildStderr) -> tokio::task::JoinHandle<Vec<String>> {
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr);
+        let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL_LINES);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let line: String = redact_urls(String::from_utf8_lossy(&buf).trim_end())
+                        .chars()
+                        .take(STDERR_LINE_MAX)
+                        .collect();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if tail.len() == STDERR_TAIL_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line);
+                }
+            }
+        }
+        tail.into()
+    })
+}
+
+/// Reduce every URL in an ffmpeg line to its scheme and host. ffmpeg quotes
+/// the input URL in its errors, and a media URL can carry signed CDN tokens
+/// and says what someone was watching; the privacy policy promises video URLs
+/// stay in memory, and the host is all a diagnosis needs.
+fn redact_urls(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    loop {
+        let start = match (rest.find("http://"), rest.find("https://")) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => break,
+        };
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+        let token = &tail[..end];
+        // Keep punctuation ffmpeg puts right after the URL ("…mp4: Server …").
+        let bare = token.trim_end_matches([':', ',', ';', ')', '\'', '"']);
+        match url::Url::parse(bare) {
+            Ok(u) => {
+                out.push_str(u.scheme());
+                out.push_str("://");
+                out.push_str(u.host_str().unwrap_or("?"));
+                out.push_str("/…");
+            }
+            Err(_) => out.push_str("<url>"),
+        }
+        out.push_str(&token[bare.len()..]);
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// ` — ffmpeg said: …` for a log line, or nothing when it said nothing.
+fn describe_tail(tail: &[String]) -> String {
+    if tail.is_empty() {
+        String::new()
+    } else {
+        format!(" — ffmpeg said: {}", tail.join(" | "))
+    }
+}
+
 /// Owns the child: reaps it on natural exit, kills it on signal. The child is
 /// dropped at the end of this task, so `kill_on_drop` is the final backstop.
 async fn supervise(
     mut child: Child,
     kill_rx: oneshot::Receiver<()>,
+    stderr_tail: Option<tokio::task::JoinHandle<Vec<String>>>,
+    room_dir: PathBuf,
     state: Arc<AppState>,
     room_id: String,
     generation: u64,
@@ -301,12 +471,33 @@ async fn supervise(
             let _ = child.kill().await;
         }
         status = child.wait() => {
+            // The pipe closes with the child, so this finishes promptly.
+            let tail = match stderr_tail {
+                Some(handle) => handle.await.unwrap_or_default(),
+                None => Vec::new(),
+            };
             match status {
-                // Clean EOF on a finite source: the event playlist is now a
-                // complete VOD — nothing to do.
-                Ok(s) if s.success() => {}
+                // A clean exit on a finite source means the event playlist is
+                // now a complete VOD — if the files are really there. On a full
+                // streams volume ffmpeg's HLS muxer writes empty segments and an
+                // empty playlist, says nothing at -loglevel warning, and still
+                // exits 0; the room then sat on a frozen player with no error.
+                Ok(s) if s.success() => {
+                    let dir = room_dir.clone();
+                    let verdict = tokio::task::spawn_blocking(move || check_output(&dir))
+                        .await
+                        .unwrap_or_else(|e| Err(format!("its output could not be checked ({e})")));
+                    if let Err(why) = verdict {
+                        tracing::warn!(
+                            "stream {room_id}: ffmpeg exited cleanly but {why} — is the streams \
+                             volume full? (raise STREAMS_TMPFS_SIZE){}",
+                            describe_tail(&tail)
+                        );
+                        mark_error(&state, &room_id, generation).await;
+                    }
+                }
                 Ok(s) => {
-                    tracing::warn!("stream {room_id}: ffmpeg exited {s}");
+                    tracing::warn!("stream {room_id}: ffmpeg exited {s}{}", describe_tail(&tail));
                     mark_error(&state, &room_id, generation).await;
                 }
                 Err(e) => {
@@ -317,6 +508,31 @@ async fn supervise(
             state.streams.forget(&room_id, generation).await;
         }
     }
+}
+
+/// Why a finished stream's output cannot be played, if it cannot: the
+/// playlist must list at least one segment, and every segment it lists must
+/// exist and be non-empty.
+fn check_output(room_dir: &Path) -> Result<(), String> {
+    let playlist = std::fs::read_to_string(room_dir.join(PLAYLIST_NAME))
+        .map_err(|e| format!("its playlist is unreadable ({e})"))?;
+    let mut listed = 0usize;
+    for name in playlist.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        listed += 1;
+        // ffmpeg writes bare file names; anything else is not ours to stat.
+        if name.contains(['/', '\\']) {
+            continue;
+        }
+        match std::fs::metadata(room_dir.join(name)) {
+            Ok(meta) if meta.len() > 0 => {}
+            Ok(_) => return Err(format!("segment {name} is empty")),
+            Err(_) => return Err(format!("segment {name} is missing")),
+        }
+    }
+    if listed == 0 {
+        return Err("its playlist lists no segments".to_string());
+    }
+    Ok(())
 }
 
 /// Poll for a playable playlist, then flip the room to ready. Gives up (marks
@@ -414,6 +630,14 @@ pub struct PreparedSource {
 /// extensions) are fed straight in; generic page URLs go through the yt-dlp
 /// resolver to extract separate video+audio + the headers needed to fetch them.
 pub async fn prepare_source(state: &AppState, media: &Media) -> Result<PreparedSource, String> {
+    // Scheme gate first, and unconditionally. `sanitize_url` already enforces
+    // http(s) on the inbound WS path, but that guarantee lives in ws.rs and
+    // this fn is `pub`; re-asserting it here is what stops a future caller from
+    // handing ffmpeg a `file:`/`concat:` input. Note `allow_private_urls` must
+    // NOT skip this: that flag is about reaching a LAN Jellyfin/NAS.
+    if !is_allowed_stream_url(&media.source) {
+        return Err("URL scheme is not allowed".to_string());
+    }
     // SSRF gate: everything below ends with a server-side fetch of the pasted
     // URL (ffmpeg directly, or yt-dlp via the resolver), so refuse hosts that
     // resolve to private/internal addresses unless explicitly allowed.
@@ -466,6 +690,23 @@ pub async fn prepare_source(state: &AppState, media: &Media) -> Result<PreparedS
     if source.video_url.is_empty() {
         return Err("resolver returned no video url".to_string());
     }
+
+    // The gate above covered `media.source` — the page URL the user pasted.
+    // These URLs are different: yt-dlp extracted them *from* that page, so they
+    // are attacker-influenced and have never been checked. Without this, a
+    // crafted page whose extractor yields `file:///etc/passwd` or
+    // `http://watchsync-server:3000/...` hands that straight to `ffmpeg -i`.
+    for url in [Some(&source.video_url), source.audio_url.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if !is_allowed_stream_url(url) {
+            return Err("resolver returned a disallowed stream url".to_string());
+        }
+        if !state.config.allow_private_urls && !crate::media::is_public_target(url).await {
+            return Err("resolver returned a private/unresolvable stream url".to_string());
+        }
+    }
     Ok(PreparedSource {
         source,
         title: body.title.filter(|t| !t.trim().is_empty()),
@@ -475,4 +716,128 @@ pub async fn prepare_source(state: &AppState, media: &Media) -> Result<PreparedS
 
 fn into_pairs(map: HashMap<String, String>) -> Vec<(String, String)> {
     map.into_iter().collect()
+}
+
+/// `true` if `s` holds any ASCII control character (CR/LF included).
+fn has_control_chars(s: &str) -> bool {
+    s.chars().any(|c| c.is_ascii_control())
+}
+
+/// `true` for a URL that is safe to hand to `ffmpeg -i`. Scheme-only check;
+/// the host still has to clear `media::is_public_target`. Deliberately an
+/// allow-list: ffmpeg speaks a long tail of protocols (`file:`, `concat:`,
+/// `subfile:`, `pipe:`, …) that must never come from an untrusted source.
+fn is_allowed_stream_url(url: &str) -> bool {
+    if has_control_chars(url) || url.len() > 8192 {
+        return false;
+    }
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ffmpeg speaks a long tail of protocols beyond http(s). Resolver output
+    /// is derived from a user-pasted page, so it is untrusted input to `-i`.
+    #[test]
+    fn stream_url_scheme_allowlist() {
+        for url in [
+            "file:///etc/passwd",
+            "concat:/etc/passwd|/etc/shadow",
+            "subfile,,start,0,end,100,,:/etc/passwd",
+            "pipe:0",
+            "ftp://example.com/x.mp4",
+            "data:video/mp4;base64,AAAA",
+            "rtmp://example.com/live",
+            "",
+        ] {
+            assert!(!is_allowed_stream_url(url), "{url} must be rejected");
+        }
+        for url in [
+            "http://example.com/a.mp4",
+            "https://example.com/a.m3u8?sig=abc",
+            "HTTPS://EXAMPLE.COM/A.MP4",
+        ] {
+            assert!(is_allowed_stream_url(url), "{url} must be allowed");
+        }
+    }
+
+    #[test]
+    fn stream_url_rejects_control_chars_and_overlong() {
+        assert!(!is_allowed_stream_url("http://example.com/a\r\nHost: evil"));
+        assert!(!is_allowed_stream_url("http://example.com/a\n"));
+        assert!(!is_allowed_stream_url(&format!("https://e.com/{}", "a".repeat(9000))));
+    }
+
+    /// A \r or \n in a resolver-supplied header injects extra headers into
+    /// ffmpeg's outbound request, so such pairs are dropped entirely.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("watchsync-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    const PLAYLIST: &str = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\nseg_00000.ts\n#EXTINF:4.0,\nseg_00001.ts\n#EXT-X-ENDLIST\n";
+
+    #[test]
+    fn finished_output_with_real_segments_passes() {
+        let dir = scratch_dir("ok");
+        std::fs::write(dir.join(PLAYLIST_NAME), PLAYLIST).unwrap();
+        std::fs::write(dir.join("seg_00000.ts"), b"x").unwrap();
+        std::fs::write(dir.join("seg_00001.ts"), b"x").unwrap();
+        assert_eq!(check_output(&dir), Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What ffmpeg leaves behind on a full volume, while exiting 0.
+    #[test]
+    fn empty_playlist_or_segments_fail_the_check() {
+        let dir = scratch_dir("full");
+        std::fs::write(dir.join(PLAYLIST_NAME), "").unwrap();
+        assert!(check_output(&dir).unwrap_err().contains("no segments"));
+
+        std::fs::write(dir.join(PLAYLIST_NAME), PLAYLIST).unwrap();
+        std::fs::write(dir.join("seg_00000.ts"), b"x").unwrap();
+        std::fs::write(dir.join("seg_00001.ts"), b"").unwrap();
+        assert!(check_output(&dir).unwrap_err().contains("seg_00001.ts is empty"));
+
+        std::fs::remove_file(dir.join("seg_00001.ts")).unwrap();
+        assert!(check_output(&dir).unwrap_err().contains("missing"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_playlist_fails_the_check() {
+        let dir = scratch_dir("none");
+        assert!(check_output(&dir).unwrap_err().contains("unreadable"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn logged_ffmpeg_output_keeps_only_the_host_of_urls() {
+        assert_eq!(
+            redact_urls(
+                "https://cdn.example.com/v/abc.mp4?sig=SECRET&exp=1: Server returned 403 Forbidden"
+            ),
+            "https://cdn.example.com/…: Server returned 403 Forbidden"
+        );
+        assert_eq!(
+            redact_urls("Opening 'http://a.example/x.ts' and https://b.example/y.m3u8 failed"),
+            "Opening 'http://a.example/…' and https://b.example/… failed"
+        );
+        assert_eq!(redact_urls("[https @ 0x5b] HTTP error 403 Forbidden"), "[https @ 0x5b] HTTP error 403 Forbidden");
+        assert_eq!(redact_urls("bad https://[oops"), "bad <url>");
+    }
+
+    #[test]
+    fn control_chars_detected_in_header_pairs() {
+        assert!(has_control_chars("evil\r\nX-Injected: 1"));
+        assert!(has_control_chars("line\nbreak"));
+        assert!(has_control_chars("tab\there"));
+        assert!(!has_control_chars("Mozilla/5.0 (X11; Linux x86_64)"));
+        assert!(!has_control_chars("https://www.youtube.com/"));
+    }
 }

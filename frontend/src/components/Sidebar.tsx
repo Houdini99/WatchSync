@@ -19,6 +19,10 @@ export default function Sidebar() {
     const active = activeTab === id;
     return (
       <button
+        role="tab"
+        id={`tab-${id}`}
+        aria-selected={active}
+        aria-controls={`panel-${id}`}
         onClick={() => select(id)}
         className={`flex flex-1 items-center justify-center gap-1.5 border-b-2 px-2 py-3.5 transition ${
           active ? 'border-accent text-text' : 'border-transparent text-dim hover:text-text'
@@ -40,14 +44,26 @@ export default function Sidebar() {
 
   return (
     <aside className="flex min-h-0 flex-col border-t border-border bg-surface lg:col-start-2 lg:row-start-2 lg:border-l lg:border-t-0 h-[55vh] lg:h-auto">
-      <div className="flex border-b border-border">
+      <div role="tablist" aria-label="Room panels" className="flex border-b border-border">
         {tab('chat', 'Chat', unread, true)}
         {tab('queue', 'Queue', queueCount)}
         {tab('users', 'Users', userCount)}
       </div>
-      {activeTab === 'chat' && <ChatPanel />}
-      {activeTab === 'queue' && <QueuePanel />}
-      {activeTab === 'users' && <UsersPanel />}
+      {activeTab === 'chat' && (
+        <div role="tabpanel" id="panel-chat" aria-labelledby="tab-chat" className="contents">
+          <ChatPanel />
+        </div>
+      )}
+      {activeTab === 'queue' && (
+        <div role="tabpanel" id="panel-queue" aria-labelledby="tab-queue" className="contents">
+          <QueuePanel />
+        </div>
+      )}
+      {activeTab === 'users' && (
+        <div role="tabpanel" id="panel-users" aria-labelledby="tab-users" className="contents">
+          <UsersPanel />
+        </div>
+      )}
     </aside>
   );
 }

@@ -116,8 +116,10 @@ export type ClientMsg =
   | { type: 'queue_remove'; index: number }
   | { type: 'queue_move'; from: number; to: number }
   | { type: 'queue_skip'; ended_media?: string }
+  | { type: 'queue_play'; index: number }
   | { type: 'kick_user'; client_id: string }
   | { type: 'ban_user'; client_id: string }
+  | { type: 'transfer_host'; client_id: string }
   | { type: 'lock_room'; locked: boolean }
   | { type: 'set_persistent'; persistent: boolean }
   | { type: 'media_title'; title: string }

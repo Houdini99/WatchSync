@@ -25,11 +25,36 @@
 # state is the two named volumes at the bottom: `watchsync-streams` (tmpfs,
 # scratch) and `watchsync-data` (durable, the accounts database).
 
+# Shared defaults. YAML anchors keep these identical across services without
+# four copies drifting apart.
+x-logging: &logging
+  # Without this, json-file logs grow unbounded and eventually fill
+  # /var/lib/docker/containers -- taking the host down, not just the stack.
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-security: &security
+  # None of these services needs to gain privileges or hold capabilities.
+  # ffmpeg, yt-dlp and nginx all run fine without them.
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
 services:
   watchsync-server:
     image: watchsync-server:latest
     container_name: watchsync-server
     restart: unless-stopped
+    <<: *security
+    logging: *logging
+    # No limits at all previously: one runaway ffmpeg or a yt-dlp burst could
+    # OOM the host and take down all four containers, not just itself.
+    mem_limit: 2g
+    cpus: "2.0"
+    pids_limit: 512
     environment:
       - HOST=0.0.0.0
       - PORT=3000
@@ -37,8 +62,13 @@ services:
       # origin (fine for testing). Comma-separate to allow several.
       - CORS_ORIGIN=${PUBLIC_ORIGIN:-*}
       - RUST_LOG=${LOG_LEVEL:-info}
+      # Whose X-Real-IP / X-Forwarded-For we believe when keying per-IP rate
+      # limits. Bare name on purpose: it passes the value through only when
+      # actually set, so leaving it out means "unset" (default: private space,
+      # covering the watchsync-client hop) rather than "" ("trust nothing").
+      - TRUSTED_PROXIES
       # yt-dlp resolver sidecar (Vimeo/Twitch/Reddit/…). Set to "" to disable —
-      # /api/resolve then returns 501 and non-native links are best-effort only.
+      # subtitles then return 501 and non-direct links go to ffmpeg unresolved.
       - RESOLVER_URL=${RESOLVER_URL:-http://watchsync-resolver:8080}
       # Allow pasting media URLs that resolve to private/LAN addresses (your
       # Jellyfin, a NAS, …). Off by default: on a public instance this is an
@@ -54,26 +84,48 @@ services:
       # Session cookie is HTTPS-only by default; set "false" only for a
       # plain-HTTP LAN install (no reverse proxy / no TLS).
       - COOKIE_SECURE=${COOKIE_SECURE:-true}
-      # Optional tunables — uncomment to override. Values below are the actual
-      # defaults from backend/src/config.rs:
-      # - MAX_USERS_PER_ROOM=50
-      # - MAX_ROOMS=5000
-      # - MAX_QUEUE_LENGTH=200
-      # - EMPTY_ROOM_TTL_MS=300000
-      # - RECONNECT_GRACE_MS=12000
-      # - HEARTBEAT_MS=4000
-      # - DRIFT_TOLERANCE_SEC=1.5
-      # - CHAT_HISTORY_LIMIT=80
-      # - SESSION_TTL_DAYS=30
-      # - ALLOWED_RATES=0.25,0.5,0.75,1,1.25,1.5,1.75,2
-      # - HLS_SEGMENT_SEC=4
-      # - STREAM_AUDIO_BITRATE=192k
-      # - STREAM_READY_TIMEOUT_SEC=30
+      # Optional tunables. Bare names, not NAME=${NAME:-default}: compose then
+      # passes each through ONLY when it is actually set in your environment or
+      # .env, and the server falls back to its own default otherwise. That
+      # keeps the defaults in exactly one place (backend/src/config.rs) instead
+      # of duplicating them here where the two copies would drift.
+      #
+      # These used to be commented out, while README.md claimed every knob was
+      # env-overridable with no rebuild -- compose only substitutes variables it
+      # textually references, so putting them in .env did nothing.
+      - MAX_USERS_PER_ROOM
+      - MAX_ROOMS
+      - MAX_QUEUE_LENGTH
+      - EMPTY_ROOM_TTL_MS
+      - RECONNECT_GRACE_MS
+      - HEARTBEAT_MS
+      - DRIFT_TOLERANCE_SEC
+      - CHAT_HISTORY_LIMIT
+      - SESSION_TTL_DAYS
+      - ALLOWED_RATES
+      - HLS_SEGMENT_SEC
+      - STREAM_AUDIO_BITRATE
+      - STREAM_READY_TIMEOUT_SEC
+      - STREAM_MAX_BYTES
+      - STREAMS_DIR
     depends_on:
       watchsync-resolver:
-        condition: service_started
+        condition: service_healthy
     networks:
-      - proxy
+      watchsync-internal:
+        # Distinct alias, and the name nginx.conf actually proxies to.
+        #
+        # watchsync-client sits on BOTH networks, and Docker's embedded DNS
+        # resolves a name across all of a container's networks. If anything on
+        # the shared `proxy` network is also called "watchsync-server" -- which
+        # is exactly the case mid-rollout, while the previous stack's
+        # container_name is still attached -- then `proxy_pass
+        # http://watchsync-server:3000` can silently reach the OLD container.
+        # This was observed: a test client resolved watchsync-server to the
+        # previous stack's IP and proxied to it. A name that exists only here
+        # cannot be shadowed.
+        aliases:
+          - watchsync-server-int
     # The on-the-fly HLS proxy writes /dev/shm/streams/{room}/… here and Nginx
     # in watchsync-client serves the same files directly — the volume MUST be
     # mounted in both containers or every non-YouTube stream 404s.
@@ -98,6 +150,13 @@ services:
     image: watchsync-resolver:latest
     container_name: watchsync-resolver
     restart: unless-stopped
+    <<: *security
+    logging: *logging
+    # No limits at all previously: one runaway ffmpeg or a yt-dlp burst could
+    # OOM the host and take down all four containers, not just itself.
+    mem_limit: 1g
+    cpus: "1.5"
+    pids_limit: 256
     environment:
       # PO-token provider used for YouTube subtitle extraction (see
       # watchsync-bgutil below). Set to "" to disable — subtitle listing still
@@ -106,21 +165,51 @@ services:
       - POT_PROVIDER_URL=${POT_PROVIDER_URL:-http://watchsync-bgutil:4416}
       # Same SSRF policy as the server (yt-dlp fetches user-pasted URLs).
       - ALLOW_PRIVATE_URLS=${ALLOW_PRIVATE_URLS:-false}
-      # Optional tunables (defaults from resolver/app.py):
-      # - RESOLVE_TIMEOUT=20     # per-extraction socket timeout, seconds
-      # - SUBS_CACHE_TTL=900     # subtitle-track metadata cache, seconds
+      # Optional tunables (defaults live in resolver/app.py). Bare names, so
+      # each is passed through only when set — see the note on the server's
+      # block above.
+      - RESOLVE_TIMEOUT
+      - SUBS_CACHE_TTL
+      - BODY_CACHE_MAX_BYTES
+      - RESOLVER_MAX_CONCURRENT
+      - RESOLVER_SLOT_WAIT
+      - RESOLVER_LOG
+    depends_on:
+      watchsync-bgutil:
+        condition: service_healthy
     networks:
-      - proxy
+      - watchsync-internal
+    healthcheck:
+      # The image defines its own, but compose needs one declared here for
+      # `condition: service_healthy` above to gate on.
+      test: ["CMD", "python", "-c",
+             "import urllib.request,os;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8080')+'/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   # Internal-only: mints YouTube "PO tokens" (BotGuard attestation) for the
   # resolver's subtitle extraction. YouTube requires these on caption requests
   # for auto-translated languages; without them viewers' browsers get 429s.
   watchsync-bgutil:
-    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    # Pinned, and MUST match POT_PLUGIN_VERSION in resolver/Dockerfile --
+    # upstream requires the plugin and this provider server to be the same
+    # version. They used to float independently (:latest here, --upgrade
+    # there), which breaks PO tokens silently and therefore auto-translated
+    # subtitles.
+    image: brainicism/bgutil-ytdlp-pot-provider:1.2.2
     container_name: watchsync-bgutil
     restart: unless-stopped
+    <<: *security
+    logging: *logging
+    # No limits at all previously: one runaway ffmpeg or a yt-dlp burst could
+    # OOM the host and take down all four containers, not just itself.
+    mem_limit: 512m
+    cpus: "0.5"
+    pids_limit: 128
     networks:
-      - proxy
+      - watchsync-internal
     healthcheck:
       # Node image (no python inside); the provider listens on 4416 and its
       # health endpoint is GET /ping.
@@ -134,11 +223,30 @@ services:
     image: watchsync-client:latest
     container_name: watchsync-client
     restart: unless-stopped
+    # The stock nginx image starts as root, chowns its cache dirs, then drops
+    # to the nginx user -- so a bare `cap_drop: ALL` makes it fail to start
+    # with chown("/var/cache/nginx/client_temp") EPERM. Add back only what it
+    # actually needs. (nginxinc/nginx-unprivileged would remove the need
+    # entirely, but it listens on 8080 and that changes the edge proxy config.)
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - NET_BIND_SERVICE
+    <<: *security
+    logging: *logging
+    # No limits at all previously: one runaway ffmpeg or a yt-dlp burst could
+    # OOM the host and take down all four containers, not just itself.
+    mem_limit: 256m
+    cpus: "0.5"
+    pids_limit: 128
     depends_on:
       watchsync-server:
-        condition: service_started
+        condition: service_healthy
     networks:
+      # The only service on both: it terminates the edge and proxies inward.
       - proxy
+      - watchsync-internal
     # Read side of the shared RAM disk: nginx.conf aliases /api/streams/ to
     # /dev/shm/streams/ and serves the playlists/segments with no upstream hop.
     volumes:
@@ -152,8 +260,26 @@ services:
       retries: 3
 
 networks:
+  # The pre-existing edge network your reverse proxy lives on. ONLY
+  # watchsync-client joins it now.
   proxy:
     external: true
+
+  # Private network for the three internal services.
+  #
+  # The header comment above used to claim "only the first is reachable from
+  # the edge; the rest are internal" while all four sat on `proxy` -- the same
+  # L2 segment as the reverse proxy, Portainer, and every other container
+  # attached to it. Anything there could reach watchsync-server:3000 and
+  # watchsync-resolver:8080 directly, bypassing Nginx and therefore the CSP,
+  # the real-IP handling and the rate limiter.
+  #
+  # NOT `internal: true`: that would also cut off egress, and the server and
+  # resolver must reach the public internet (ffmpeg fetches media, yt-dlp
+  # fetches pages, the oEmbed title lookup). A separate bridge network gives
+  # isolation from `proxy` while keeping outbound NAT.
+  watchsync-internal:
+    driver: bridge
 
 volumes:
   # RAM-backed scratch space for the per-room HLS proxy, shared between the

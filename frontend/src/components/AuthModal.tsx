@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../lib/api';
+import { PRIVACY_PATH, navigate } from '../lib/nav';
 import { useStore } from '../store';
 
 type Mode = 'login' | 'register';
@@ -25,6 +26,17 @@ export default function AuthModal() {
     const t = setTimeout(() => userRef.current?.focus(), 50);
     return () => clearTimeout(t);
   }, [open, mode]);
+
+  // Escape closes. The backdrop is click-only, so without this there was no
+  // keyboard way out of the dialog at all.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') useStore.getState().setAuthOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open]);
 
   if (!open) return null;
 
@@ -66,14 +78,31 @@ export default function AuthModal() {
   );
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4" onClick={close}>
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4"
+      onClick={close}
+      // The backdrop is a click-only affordance; Escape (below) is the
+      // keyboard equivalent, so it stays out of the tab order rather than
+      // becoming a focusable div.
+      aria-hidden
+    >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="auth-modal-title"
         className="w-full max-w-sm rounded-[10px] border border-border bg-surface p-8 shadow-panel"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-5 flex items-center justify-between">
-          <h2 className="text-xl font-semibold">{mode === 'login' ? 'Sign in' : 'Create account'}</h2>
-          <button className="text-dim transition hover:text-text" title="Close" onClick={close}>
+          <h2 id="auth-modal-title" className="text-xl font-semibold">
+            {mode === 'login' ? 'Sign in' : 'Create account'}
+          </h2>
+          <button
+            className="text-dim transition hover:text-text"
+            title="Close"
+            aria-label="Close"
+            onClick={close}
+          >
             ✕
           </button>
         </div>
@@ -130,7 +159,18 @@ export default function AuthModal() {
         <p className="mt-4 text-center text-xs text-dim">
           {mode === 'register'
             ? 'No email needed. Accounts unlock permanent custom room links.'
-            : 'Accounts are optional — rooms work fine without one.'}
+            : 'Accounts are optional — rooms work fine without one.'}{' '}
+          <a
+            href={PRIVACY_PATH}
+            onClick={(e) => {
+              e.preventDefault();
+              useStore.getState().setAuthOpen(false);
+              navigate(PRIVACY_PATH);
+            }}
+            className="text-accent underline-offset-2 hover:underline"
+          >
+            What data is stored?
+          </a>
         </p>
       </div>
     </div>

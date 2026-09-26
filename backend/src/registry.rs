@@ -5,6 +5,8 @@
 //! link never dies. These handlers cover claiming, listing, availability
 //! checks, and release; all of them require a signed-in session.
 
+use axum::extract::ConnectInfo;
+use std::net::SocketAddr;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -96,10 +98,15 @@ pub struct ClaimBody {
 
 pub async fn claim_room(
     State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     Json(body): Json<ClaimBody>,
 ) -> Response {
-    if !state.auth_limiter.allow(&client_ip(&headers)).await {
+    if !state
+        .auth_limiter
+        .allow(&client_ip(&headers, peer.ip(), &state.config))
+        .await
+    {
         return too_many_requests();
     }
     let Some(user) = auth::authed_user(&state, &headers).await else {
@@ -114,25 +121,27 @@ pub async fn claim_room(
     if state.rooms.read().await.contains_key(&slug) {
         return json_err(StatusCode::CONFLICT, "That name is taken");
     }
-    match db::owner_room_count(&state.db, user.id).await {
-        Ok(n) if n >= state.config.max_rooms_per_user as i64 => {
-            return json_err(
-                StatusCode::FORBIDDEN,
-                "Room limit reached — release one to claim another",
-            );
-        }
-        Ok(_) => {}
-        Err(e) => {
-            tracing::error!("owner_room_count failed: {e}");
-            return json_err(StatusCode::INTERNAL_SERVER_ERROR, "Could not claim room");
-        }
-    }
-    match db::claim_slug(&state.db, &slug, user.id, now_ms() as i64).await {
+    // The per-owner cap is enforced inside claim_slug's INSERT rather than by a
+    // count here: two concurrent POSTs from one session both used to read
+    // n = max - 1 and both insert, so a user could exceed max_rooms_per_user.
+    match db::claim_slug(
+        &state.db,
+        &slug,
+        user.id,
+        now_ms() as i64,
+        state.config.max_rooms_per_user as i64,
+    )
+    .await
+    {
         Ok(db::ClaimOutcome::Claimed) => {
             tracing::info!("room slug claimed: {slug} by {}", user.username);
             Json(json!({ "slug": slug })).into_response()
         }
         Ok(db::ClaimOutcome::Taken) => json_err(StatusCode::CONFLICT, "That name is taken"),
+        Ok(db::ClaimOutcome::AtLimit) => json_err(
+            StatusCode::FORBIDDEN,
+            "Room limit reached — release one to claim another",
+        ),
         Err(e) => {
             tracing::error!("claim_slug failed: {e}");
             json_err(StatusCode::INTERNAL_SERVER_ERROR, "Could not claim room")

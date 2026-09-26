@@ -38,6 +38,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import yt_dlp
@@ -52,6 +53,19 @@ TIMEOUT = int(os.environ.get("RESOLVE_TIMEOUT", "20"))
 ALLOW_PRIVATE_URLS = os.environ.get("ALLOW_PRIVATE_URLS", "").strip().lower() in ("1", "true", "yes")
 
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
+
+# Logging. Previously this service printed exactly one line for its whole
+# lifetime: log_message was stubbed out and yt-dlp ran with quiet/no_warnings,
+# so `docker logs watchsync-resolver` was permanently empty -- no access log,
+# no extraction failures, nothing. README told operators to debug resolver
+# problems from the server's logs, which only ever see "resolver returned 502".
+# Keep it cheap and unbuffered; RESOLVER_LOG=0 restores silence.
+LOG_ENABLED = os.environ.get("RESOLVER_LOG", "1").strip().lower() not in ("0", "false", "no")
+
+
+def log(msg):
+    if LOG_ENABLED:
+        print("%s %s" % (time.strftime("%Y-%m-%dT%H:%M:%S"), msg), flush=True)
 
 
 def _ip_is_internal(ip):
@@ -69,11 +83,17 @@ def _ip_is_internal(ip):
 
 
 def url_host_allowed(url):
-    """False unless every address the URL's host resolves to is public.
-    Fails closed on parse/DNS errors (yt-dlp would fail there anyway)."""
+    """False unless the URL is http(s) and every address its host resolves to
+    is public. Fails closed on parse/DNS errors (yt-dlp would fail there
+    anyway). The scheme check runs even under ALLOW_PRIVATE_URLS: that flag is
+    about reaching a LAN Jellyfin/NAS, never about handing `file:`/`ftp:` to a
+    fetcher."""
+    parts = urllib.parse.urlparse(url)
+    if parts.scheme not in ("http", "https"):
+        return False
     if ALLOW_PRIVATE_URLS:
         return True
-    host = urllib.parse.urlparse(url).hostname
+    host = parts.hostname
     if not host:
         return False
     try:
@@ -84,6 +104,29 @@ def url_host_allowed(url):
     if not addrs:
         return False
     return not any(_ip_is_internal(ipaddress.ip_address(a)) for a in addrs)
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-runs the SSRF gate on every hop.
+
+    urllib follows redirects transparently, so validating only the URL we were
+    handed is no gate at all: `http://attacker/x.vtt` -> `302` ->
+    `http://watchsync-server:3000/...` needs no DNS trickery. Every Location is
+    re-checked here, which also re-resolves the host (so a rebind must win the
+    race on each hop rather than just once).
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not url_host_allowed(newurl):
+            raise urllib.error.HTTPError(
+                newurl, code, "redirect to a disallowed host", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# Opener used for every fetch of a URL we did not receive directly from the
+# caller (subtitle tracks come out of yt-dlp's extraction of a user-pasted
+# page, so they are attacker-influenced and get the same treatment).
+_SAFE_OPENER = urllib.request.build_opener(_SafeRedirectHandler)
 
 # bestvideo+bestaudio, falling back to the best combined/HLS stream. Because the
 # server muxes downstream, the split pair is now the *preferred* outcome — we no
@@ -131,6 +174,25 @@ def _first_with_url(info):
     return None
 
 
+def _has_audio(fmt):
+    """True unless the format explicitly declares no audio track.
+
+    HLS master playlists often leave acodec unset/'unknown' while their
+    variants do carry audio, so only an explicit "none" counts as silent.
+    """
+    return (fmt.get("acodec") or "unknown") != "none"
+
+
+def _first_playable_with_audio(info):
+    """The first single stream that is not explicitly video-only."""
+    if info.get("url") and _has_audio(info):
+        return info
+    for fmt in info.get("formats") or []:
+        if fmt.get("url") and _has_audio(fmt):
+            return fmt
+    return None
+
+
 def resolve(url):
     with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -164,9 +226,18 @@ def resolve(url):
 
     # Case 2 — a single combined stream (already-muxed progressive, or HLS such
     # as Twitch live). The server feeds it to ffmpeg as one input.
-    single = _first_with_url(info if not req else (req[0] if req else info)) or _first_with_url(info)
+    #
+    # This deliberately does NOT fall back to req[0]. When Case 1 found a pair
+    # but one half had no url, req[0] is the VIDEO-ONLY format, and returning
+    # it as kind:"muxed" with audio_url:None yields silent playback -- exactly
+    # the "video-only" regression this module's docstring says the split
+    # contract fixed. Prefer a format that actually carries audio, and only
+    # accept a silent one when nothing else exists.
+    single = _first_playable_with_audio(info) or _first_with_url(info)
     if not single or not single.get("url"):
         raise ValueError("no playable format found")
+    if not _has_audio(single):
+        log("resolve: only a video-only format available for %s" % url)
     direct = single["url"]
     is_hls = _is_hls(single)
     # Prefer the HLS *master* playlist when yt-dlp exposes one — ffmpeg/hls.js
@@ -233,7 +304,12 @@ if POT_PROVIDER_URL:
         "youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]},
     }
 
-_subs_cache = {}  # url -> (monotonic timestamp, {lang: {name, kind, url, rank}})
+# OrderedDict, not dict: eviction pops the oldest INSERTION, and refreshing an
+# existing key does not move it. With a plain dict the hottest URL -- refreshed
+# every SUBS_CACHE_TTL, still first in insertion order -- was the first one
+# evicted, so the hit rate collapsed under exactly the load a cache is for.
+# move_to_end on every hit and every write makes this a real LRU.
+_subs_cache = OrderedDict()  # url -> (monotonic ts, {lang: {name, kind, url, rank}})
 _subs_lock = threading.Lock()
 
 
@@ -271,7 +347,10 @@ def subtitle_tracks(url):
     with _subs_lock:
         hit = _subs_cache.get(url)
         if hit and now - hit[0] < SUBS_CACHE_TTL:
+            _subs_cache.move_to_end(url)
             return hit[1]
+        if hit:
+            del _subs_cache[url]  # expired: drop it rather than shadow it
 
     with yt_dlp.YoutubeDL(SUBS_YDL_OPTS) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -320,9 +399,10 @@ def subtitle_tracks(url):
             put(key[:-5] if key.endswith("-orig") else key, name, "auto", track_url, 1)
 
     with _subs_lock:
-        if len(_subs_cache) >= SUBS_CACHE_MAX:
-            _subs_cache.pop(next(iter(_subs_cache)))
         _subs_cache[url] = (now, tracks)
+        _subs_cache.move_to_end(url)
+        while len(_subs_cache) > SUBS_CACHE_MAX:
+            _subs_cache.popitem(last=False)
     return tracks
 
 
@@ -343,7 +423,11 @@ def list_subtitles(url):
 # never re-fetch is a token saved for the next language someone picks.
 BODY_CACHE_TTL = 3600
 BODY_CACHE_MAX = 60
-_body_cache = {}
+# Also cap by BYTES, not just entry count: 60 entries x MAX_SUB_BYTES (3 MiB)
+# is 180 MiB of subtitle bodies held in a container that has no memory limit.
+BODY_CACHE_MAX_BYTES = int(os.environ.get("BODY_CACHE_MAX_BYTES", str(24 * 1024 * 1024)))
+_body_cache = OrderedDict()
+_body_bytes = 0
 _body_lock = threading.Lock()
 
 # Attempt schedule for 429s: the tlang token bucket refills within ~20s, so a
@@ -355,14 +439,24 @@ RETRY_DELAYS = (6, 12)
 def fetch_subtitle(url, lang):
     """Return (vtt bytes) for one language, or raise LookupError/ValueError."""
     now = time.monotonic()
+    key = (url, lang)
     with _body_lock:
-        hit = _body_cache.get((url, lang))
+        hit = _body_cache.get(key)
         if hit and now - hit[0] < BODY_CACHE_TTL:
+            _body_cache.move_to_end(key)
             return hit[1]
 
     track = subtitle_tracks(url).get(lang)
     if not track:
         raise LookupError("no subtitles for language %r" % lang)
+
+    # The track URL comes out of yt-dlp's extraction of a user-pasted page, so
+    # it is attacker-influenced and gets the same SSRF gate as the page URL —
+    # without this, a crafted page pointing a caption track at an internal
+    # service turns this endpoint into a read-SSRF that returns the response
+    # body verbatim to the browser.
+    if not url_host_allowed(track["url"]):
+        raise ValueError("subtitle track host is not allowed")
 
     headers = {"User-Agent": SUB_FETCH_UA, "Referer": "https://www.youtube.com/"}
     body = None
@@ -371,7 +465,7 @@ def fetch_subtitle(url, lang):
             time.sleep(delay)
         try:
             req = urllib.request.Request(track["url"], headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with _SAFE_OPENER.open(req, timeout=15) as resp:
                 body = resp.read(MAX_SUB_BYTES + 1)
             break
         except urllib.error.HTTPError as exc:
@@ -381,13 +475,46 @@ def fetch_subtitle(url, lang):
         raise ValueError("subtitle track too large")
 
     with _body_lock:
-        if len(_body_cache) >= BODY_CACHE_MAX:
-            _body_cache.pop(next(iter(_body_cache)))
-        _body_cache[(url, lang)] = (now, body)
+        global _body_bytes
+        old_entry = _body_cache.pop(key, None)
+        if old_entry:
+            _body_bytes -= len(old_entry[1])
+        _body_cache[key] = (now, body)
+        _body_bytes += len(body)
+        while _body_cache and (
+            len(_body_cache) > BODY_CACHE_MAX or _body_bytes > BODY_CACHE_MAX_BYTES
+        ):
+            _, evicted = _body_cache.popitem(last=False)
+            _body_bytes -= len(evicted[1])
     return body
 
 
+# Bound concurrent extractions. ThreadingHTTPServer's mixin has no
+# max_children, so every accepted connection used to spawn a thread running a
+# full yt-dlp extraction -- CPU-heavy JS/regex/JSON parsing, i.e. real GIL
+# contention rather than idle I/O wait. Nothing capped the thread count, and
+# the listen backlog is only 5, so a burst both thrashed the interpreter and
+# started refusing connections.
+MAX_CONCURRENT = int(os.environ.get("RESOLVER_MAX_CONCURRENT", "4"))
+_slots = threading.BoundedSemaphore(MAX_CONCURRENT)
+# How long a request may wait for a slot before we shed it. Shorter than the
+# Rust caller's timeout so it gets a real 503 instead of a dead connection.
+SLOT_WAIT = float(os.environ.get("RESOLVER_SLOT_WAIT", "20"))
+
+
 class Handler(BaseHTTPRequestHandler):
+    # BaseHTTPRequestHandler.timeout is None by default, so socketserver never
+    # calls settimeout() and a client that opens a connection and sends nothing
+    # pins a thread forever. Any peer on the shared Docker network could have
+    # exhausted the pool this way.
+    timeout = 30
+
+    # NOTE: protocol_version is deliberately left at HTTP/1.0. Keep-alive would
+    # let the Rust client's connection pool avoid a handshake per call, but this
+    # server is thread-per-connection: a kept-alive idle connection holds a
+    # thread for the full `timeout` above, which works directly against the
+    # concurrency cap. Revisit together with a real worker-pool server.
+
     def _send(self, code, obj):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(code)
@@ -403,12 +530,37 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _fail(self, code, exc, what):
+        """Log the real error, return a non-leaky one.
+
+        yt-dlp's messages routinely embed the internal PO-token hostname, this
+        container's egress IP, extractor internals, cookie/config paths, and
+        the full pasted URL -- including any user:pass@ credentials. The Rust
+        server forwards our JSON body verbatim, so all of that used to reach
+        the browser of any anonymous visitor. Detail goes to the log; the
+        client gets the class of failure and nothing else.
+        """
+        log("%s failed: %s: %s" % (what, type(exc).__name__, exc))
+        return self._send(code, {"error": "%s failed" % what})
+
     def do_GET(self):  # noqa: N802 (http.server API)
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
         url = (qs.get("url") or [""])[0]
+        # Health must never queue behind extractions -- it is what the
+        # container healthcheck polls.
         if parsed.path == "/healthz":
             return self._send(200, {"ok": True})
+        # Everything below runs yt-dlp. Shed load rather than pile up threads.
+        if not _slots.acquire(timeout=SLOT_WAIT):
+            log("busy: no extraction slot within %ss for %s" % (SLOT_WAIT, parsed.path))
+            return self._send(503, {"error": "resolver busy"})
+        try:
+            return self._dispatch(parsed, qs, url)
+        finally:
+            _slots.release()
+
+    def _dispatch(self, parsed, qs, url):
         if parsed.path in ("/resolve", "/subtitles/list", "/subtitles/get"):
             if not (url.startswith("http://") or url.startswith("https://")):
                 return self._send(400, {"error": "invalid url"})
@@ -418,12 +570,12 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 return self._send(200, resolve(url))
             except Exception as exc:  # noqa: BLE001 (report any extractor failure)
-                return self._send(502, {"error": str(exc)[:300]})
+                return self._fail(502, exc, "resolve")
         if parsed.path == "/subtitles/list":
             try:
                 return self._send(200, list_subtitles(url))
             except Exception as exc:  # noqa: BLE001
-                return self._send(502, {"error": str(exc)[:300]})
+                return self._fail(502, exc, "subtitle listing")
         if parsed.path == "/subtitles/get":
             lang = (qs.get("lang") or [""])[0]
             if not lang or len(lang) > 20:
@@ -431,14 +583,19 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 body = fetch_subtitle(url, lang)
                 return self._send_raw(200, body, "text/vtt; charset=utf-8")
-            except LookupError as exc:
-                return self._send(404, {"error": str(exc)[:300]})
+            except LookupError:
+                # Safe to be specific: this one carries only the language code
+                # the caller already sent us.
+                return self._send(404, {"error": "no subtitles for that language"})
             except Exception as exc:  # noqa: BLE001
-                return self._send(502, {"error": str(exc)[:300]})
+                return self._fail(502, exc, "subtitle fetch")
         return self._send(404, {"error": "not found"})
 
-    def log_message(self, *_args):
-        pass  # keep stdout quiet; failures are returned in the response body
+    def log_message(self, fmt, *args):
+        # Single-line access log. Errors are still returned in the response
+        # body, but they must also be visible to an operator reading
+        # `docker logs`, which used to show nothing at all.
+        log("%s %s" % (self.address_string(), fmt % args))
 
 
 if __name__ == "__main__":

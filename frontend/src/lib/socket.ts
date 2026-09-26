@@ -94,10 +94,18 @@ export class Socket {
     this.statusHandlers.forEach((h) => h(connected));
   }
 
-  send(msg: ClientMsg) {
+  /**
+   * Send if the socket is open. Returns `false` when the message was dropped —
+   * callers that show success UI (a toast, clearing an input) must check it,
+   * or during the 0.5–8s reconnect backoff the user gets "Added to queue" for
+   * something that never left the browser.
+   */
+  send(msg: ClientMsg): boolean {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg));
+      return true;
     }
+    return false;
   }
 
   get isOpen() {
@@ -110,11 +118,27 @@ export class Socket {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    const ws = this.ws;
+    this.ws = null;
+    if (!ws) return;
+    // Detach BEFORE closing. `close()` is async: onclose used to fire a tick
+    // later on the socket we had already discarded, calling emitStatus(false)
+    // and scheduleReconnect(). That overwrote real errors — a join_error
+    // ("Room not found") was replaced on the landing page by "Disconnected —
+    // reconnecting…" when nothing was reconnecting — and, after a deliberate
+    // reconnect, flipped `connected` back to false on the NEW open socket.
+    ws.onopen = null;
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.onmessage = null;
     try {
-      this.ws?.close();
+      ws.close();
     } catch {
       /* ignore */
     }
-    this.ws = null;
+    // Deliberately NO emitStatus(false) here. A caller-initiated close is not
+    // "the connection dropped", and the status handler renders the disconnect
+    // path as "Disconnected — reconnecting…" — which would clobber the very
+    // message (join_error, kicked) that prompted the close in the first place.
   }
 }

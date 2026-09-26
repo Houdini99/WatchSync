@@ -2,16 +2,12 @@ import { useEffect } from 'react';
 import AuthModal from './components/AuthModal';
 import Landing from './components/Landing';
 import NicknameModal from './components/NicknameModal';
+import Privacy from './components/Privacy';
 import Room from './components/Room';
 import Toast from './components/Toast';
 import { api } from './lib/api';
+import { applyRoute } from './lib/nav';
 import { useStore } from './store';
-
-function roomIdFromUrl(): string | null {
-  // Hyphens included: registered custom slugs allow them.
-  const m = location.pathname.match(/^\/r\/([a-z0-9-]+)$/i);
-  return m ? m[1] : null;
-}
 
 export default function App() {
   const view = useStore((s) => s.view);
@@ -21,14 +17,8 @@ export default function App() {
 
   // Route from the URL on first load, and fetch the server version.
   useEffect(() => {
-    const id = roomIdFromUrl();
     const store = useStore.getState();
-    if (id) {
-      store.setRoomId(id);
-      store.setView('nickname');
-    } else {
-      store.setView('landing');
-    }
+    applyRoute();
     fetch('/api/health')
       .then((r) => r.json())
       .then((h) => {
@@ -42,6 +32,12 @@ export default function App() {
       .catch(() => {});
   }, []);
 
+  // Back/forward buttons re-route the SPA.
+  useEffect(() => {
+    window.addEventListener('popstate', applyRoute);
+    return () => window.removeEventListener('popstate', applyRoute);
+  }, []);
+
   // Keep <html data-theme> in sync.
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
@@ -49,9 +45,13 @@ export default function App() {
 
   // Tab title: surface the video title and an unread badge.
   useEffect(() => {
+    if (view === 'privacy') {
+      document.title = 'Datenschutz / Privacy — WatchSync';
+      return;
+    }
     const base = mediaTitle ? `${mediaTitle} — WatchSync` : 'WatchSync';
     document.title = unread > 0 ? `(${unread}) ${base}` : base;
-  }, [unread, mediaTitle]);
+  }, [unread, mediaTitle, view]);
 
   // Lock body scroll while in a room.
   useEffect(() => {
@@ -63,6 +63,7 @@ export default function App() {
       {view === 'landing' && <Landing />}
       {view === 'nickname' && <NicknameModal />}
       {view === 'room' && <Room />}
+      {view === 'privacy' && <Privacy />}
       <AuthModal />
       <Toast />
     </>

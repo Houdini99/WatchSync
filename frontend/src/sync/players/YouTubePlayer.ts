@@ -1,7 +1,48 @@
 import type { Media } from '../../types';
 import { PlayerEvents, type Player, type VideoStateApply } from './types';
 
-/** YouTube playback via the IFrame API (loaded by a <script> in index.html). */
+const IFRAME_API_SRC = 'https://www.youtube.com/iframe_api';
+/** An `onPlaybackRateChange` matching a rate we set ourselves this recently is
+ *  ours. Generous: the event crosses the iframe boundary via postMessage. */
+const OWN_RATE_WINDOW_MS = 2000;
+/** Shared across adapter instances: the API is a page-global, loaded once. */
+let apiPromise: Promise<boolean> | null = null;
+
+/** Fetch the IFrame API, on demand and exactly once.
+ *
+ *  It is deliberately not in index.html: loading it eagerly sends every
+ *  visitor's IP to Google before they have played anything, which is neither
+ *  necessary for the page nor easy to justify under Art. 6(1)(f) GDPR (see the
+ *  privacy policy, §7.1). Here the request only happens once someone actually
+ *  puts a YouTube video on — the function they asked for.
+ *
+ *  Resolves `false` if the script can't be fetched (a content blocker, or no
+ *  network), so the caller can surface an error instead of hanging forever. */
+function loadApi(): Promise<boolean> {
+  if (window.YT?.Player) return Promise.resolve(true);
+  if (apiPromise) return apiPromise;
+
+  apiPromise = new Promise<boolean>((resolve) => {
+    // The API invokes this global once it has finished initialising. Chain any
+    // previously registered handler rather than clobbering it.
+    const prev = window.onYouTubeIframeAPIReady;
+    window.onYouTubeIframeAPIReady = () => {
+      prev?.();
+      resolve(true);
+    };
+    const tag = document.createElement('script');
+    tag.src = IFRAME_API_SRC;
+    tag.async = true;
+    tag.onerror = () => {
+      apiPromise = null; // let a later attempt retry
+      resolve(false);
+    };
+    document.head.appendChild(tag);
+  });
+  return apiPromise;
+}
+
+/** YouTube playback via the IFrame API (fetched on demand — see `loadApi`). */
 export class YouTubePlayer implements Player {
   readonly events = new PlayerEvents();
   private yt: YTPlayer | null = null;
@@ -11,12 +52,33 @@ export class YouTubePlayer implements Player {
   private blockCheckTimer: number | null = null;
   /** True while we're playing muted because the browser blocked unmuted autoplay. */
   private mutedFallback = false;
+  /** Rate we last set ourselves, and when — see `setRate`. */
+  private ownRate: number | null = null;
+  private ownRateAt = 0;
+  /** Bumped per `load()`; `unload()` disposes. Both are checked after the API
+   *  await so a superseded or torn-down load doesn't build an iframe anyway. */
+  private loadSeq = 0;
+  private disposed = false;
 
-  constructor(private readonly mount: HTMLElement) {}
+  private readonly mount: HTMLElement;
+
+  constructor(mount: HTMLElement) {
+    this.mount = mount;
+  }
 
   async load(media: Media) {
+    const seq = ++this.loadSeq;
+    this.disposed = false;
     this.mount.innerHTML = '<div id="yt-iframe-target"></div>';
-    await this.waitForApi();
+    const ok = await this.waitForApi();
+
+    // On the first YouTube video of a session that await spans a real network
+    // round trip, so the adapter may have been torn down or replaced meanwhile.
+    if (this.disposed || seq !== this.loadSeq) return;
+    if (!ok) {
+      this.events.fire('mediaerror', { code: -1 });
+      return;
+    }
 
     if (this.yt) {
       try {
@@ -53,22 +115,16 @@ export class YouTubePlayer implements Player {
         },
         onStateChange: (e) => this.onStateChange(e.data),
         onPlaybackRateChange: (e) => {
-          if (!this.suppress) this.events.fire('ratechange', { rate: e.data });
+          if (this.suppress || this.isOwnRate(e.data)) return;
+          this.events.fire('ratechange', { rate: e.data });
         },
         onError: (e) => this.events.fire('mediaerror', { code: e.data }),
       },
     });
   }
 
-  private waitForApi(): Promise<void> {
-    return new Promise((resolve) => {
-      if (window.YT && window.YT.Player) return resolve();
-      const prev = window.onYouTubeIframeAPIReady;
-      window.onYouTubeIframeAPIReady = () => {
-        prev?.();
-        resolve();
-      };
-    });
+  private waitForApi(): Promise<boolean> {
+    return loadApi();
   }
 
   private startPolling() {
@@ -148,6 +204,7 @@ export class YouTubePlayer implements Player {
     }
     this.mount.innerHTML = '';
     this.ready = false;
+    this.disposed = true;
   }
 
   getTime() {
@@ -178,12 +235,32 @@ export class YouTubePlayer implements Player {
       return false;
     }
   }
+  isEnded() {
+    try {
+      return this.yt?.getPlayerState() === window.YT!.PlayerState.ENDED;
+    } catch {
+      return false;
+    }
+  }
   getTitle() {
     try {
       return this.yt?.getVideoData().title || null;
     } catch {
       return null;
     }
+  }
+
+  /** YouTube only accepts the speeds in `getAvailablePlaybackRates()` — coarse
+   *  steps like 1.25× — so it cannot play *slightly* fast to close drift. The
+   *  engine falls back to a (cooled-down) seek for this player. */
+  canNudgeRate() {
+    return false;
+  }
+
+  /** The IFrame player owns its buffer and seeks anywhere in the video on its
+   *  own, so there is no hole to protect the engine from here. */
+  canPlayAt() {
+    return true;
   }
 
   private withSuppression(fn: () => void) {
@@ -199,20 +276,32 @@ export class YouTubePlayer implements Player {
 
   async applyState({ currentTime, paused, rate }: VideoStateApply) {
     if (!this.ready) {
-      await new Promise<void>((resolve) => {
-        const h = () => {
-          this.events.removeEventListener('ready', h);
-          resolve();
-        };
-        this.events.addEventListener('ready', h);
-      });
+      // Bail rather than wait. SyncEngine.onHeartbeat calls this on EVERY
+      // heartbeat, and for a video that never becomes ready (blocked embed,
+      // content blocker, deleted video — onError fires, 'ready' never does)
+      // every call used to add a permanent 'ready' listener plus a promise
+      // that never settled. Nothing collected them: the engine does not await
+      // the return value, since Player.applyState is typed `void |
+      // Promise<void>`. They accumulated for as long as the room stayed on
+      // that video, and if 'ready' ever did arrive, a burst of queued seekTo
+      // calls with long-stale timestamps ran at once.
+      //
+      // Dropping the update costs nothing: the next heartbeat re-sends it, and
+      // SyncEngine.applyInitial already re-applies on 'ready'.
+      return;
     }
+    if (Math.abs(this.getRate() - rate) > 0.001) this.setRate(rate);
     this.withSuppression(() => {
       try {
-        if (Math.abs(this.getRate() - rate) > 0.001) this.yt!.setPlaybackRate(rate);
-        if (Math.abs(this.getTime() - currentTime) > 0.6) this.yt!.seekTo(currentTime, true);
+        let seeked = false;
+        if (Math.abs(this.getTime() - currentTime) > 0.6) {
+          this.yt!.seekTo(currentTime, true);
+          seeked = true;
+        }
         if (paused) this.yt!.pauseVideo();
-        else this.yt!.playVideo();
+        // playVideo() on an ENDED player starts over from 0 — never what the
+        // room means. A seek back into the video above leaves ENDED first.
+        else if (seeked || !this.isEnded()) this.yt!.playVideo();
       } catch {
         /* ignore */
       }
@@ -233,12 +322,26 @@ export class YouTubePlayer implements Player {
     this.events.fire('autoplayblocked', { blocked: false });
   }
 
+  /** Programmatic rate: the engine tracking the room, never the viewer picking
+   *  a speed (the speed menu sends its own set_rate). Its change event is
+   *  filtered by value (`isOwnRate`) rather than through `withSuppression`,
+   *  whose window would also swallow a genuine play/pause landing inside it. */
   setRate(rate: number) {
+    this.ownRate = rate;
+    this.ownRateAt = Date.now();
     try {
       this.yt?.setPlaybackRate(rate);
     } catch {
       /* ignore */
     }
+  }
+
+  private isOwnRate(rate: number) {
+    return (
+      this.ownRate !== null &&
+      Math.abs(rate - this.ownRate) < 0.001 &&
+      Date.now() - this.ownRateAt < OWN_RATE_WINDOW_MS
+    );
   }
 
   setEnabled(enabled: boolean) {

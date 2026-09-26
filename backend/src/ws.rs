@@ -16,6 +16,9 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
+
+/// Outbound queue depth per connection. Bounded on purpose — see `connection`.
+const OUT_QUEUE_DEPTH: usize = 256;
 use tokio::time::{interval, sleep, timeout};
 
 use crate::config::{Config, CorsOrigin};
@@ -56,14 +59,21 @@ pub async fn ws_handler(
     // Same-origin cookies ride the upgrade request, so the session (if any) is
     // resolved once here and pinned to the connection. Guests get `None`.
     let user = crate::auth::authed_user(&state, &headers).await;
-    ws.on_upgrade(move |socket| connection(socket, state, user))
+    // Cap frames well below axum's defaults (64 MiB message / 16 MiB frame).
+    // Nothing this protocol carries is large: the biggest legitimate client
+    // frame is a chat message or a URL, both already capped in the low
+    // kilobytes by `sanitize`. Accepting 64 MiB let one socket force ~200 MB of
+    // transient allocation per frame, in a loop, before any length check ran.
+    ws.max_message_size(64 * 1024)
+        .max_frame_size(64 * 1024)
+        .on_upgrade(move |socket| connection(socket, state, user))
 }
 
 /// Per-connection mutable state + behaviour.
 struct Conn {
     state: SharedState,
     conn_id: String,
-    out: mpsc::UnboundedSender<Message>,
+    out: mpsc::Sender<Message>,
     /// Taken and handed to the room on join, so a host kick/ban can force-close
     /// this connection. `None` once handed over (or if never joined).
     kill_tx: Option<oneshot::Sender<()>>,
@@ -80,21 +90,50 @@ struct Conn {
 }
 
 impl Conn {
+    fn new(
+        state: SharedState,
+        out: mpsc::Sender<Message>,
+        kill_tx: oneshot::Sender<()>,
+        user: Option<AuthedUser>,
+    ) -> Self {
+        let cfg = &state.config;
+        Conn {
+            conn_id: uuid::Uuid::new_v4().to_string(),
+            out,
+            kill_tx: Some(kill_tx),
+            room_id: None,
+            client_id: None,
+            user,
+            chat_bucket: TokenBucket::new(cfg.chat_bucket.capacity, cfg.chat_bucket.refill_per_sec),
+            reaction_bucket: TokenBucket::new(
+                cfg.reaction_bucket.capacity,
+                cfg.reaction_bucket.refill_per_sec,
+            ),
+            global_bucket: TokenBucket::new(
+                cfg.global_bucket.capacity,
+                cfg.global_bucket.refill_per_sec,
+            ),
+            heavy_bucket: TokenBucket::new(cfg.heavy_bucket.capacity, cfg.heavy_bucket.refill_per_sec),
+            state,
+        }
+    }
+
     fn cfg(&self) -> &Config {
         &self.state.config
     }
 
     fn send(&self, msg: ServerMsg) {
-        let _ = self.out.send(Message::Text(msg.to_json()));
+        let _ = self.out.try_send(Message::Text(msg.to_json()));
     }
 
-    /// Cheap flood guard for the chatty real-time events.
+    /// Flood guard charged once for every inbound intent (see `handle`).
     fn allow(&mut self) -> bool {
         self.global_bucket.take(1.0)
     }
 
-    /// Guard for expensive intents (change_video, queue_add): each spawns ffmpeg
-    /// or calls the resolver, so they get a tighter, separate bucket.
+    /// Guard for expensive intents (change/skip/play video, queue_add, join):
+    /// each spawns ffmpeg, calls the resolver or queries the database, so they
+    /// get a tighter, separate bucket.
     fn allow_heavy(&mut self) -> bool {
         self.heavy_bucket.take(1.0)
     }
@@ -102,10 +141,15 @@ impl Conn {
 
 async fn connection(socket: WebSocket, state: SharedState, user: Option<AuthedUser>) {
     let (mut sink, mut stream) = socket.split();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
+    // Bounded. An unbounded queue meant a client that opened the socket and
+    // then stopped reading accumulated frames in server memory without limit —
+    // heartbeats alone are one frame every HEARTBEAT_MS, plus a full room
+    // snapshot on every event. The depth is generous enough that a healthy
+    // client never reaches it, and a client that does is not draining at all.
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(OUT_QUEUE_DEPTH);
 
     // Dedicated outbound pump: everything this connection sends goes through here.
-    let send_task = tokio::spawn(async move {
+    let mut send_task = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             if sink.send(msg).await.is_err() {
                 break;
@@ -123,40 +167,24 @@ async fn connection(socket: WebSocket, state: SharedState, user: Option<AuthedUs
         tick.tick().await; // consume the immediate first tick
         loop {
             tick.tick().await;
-            if keepalive_tx.send(Message::Ping(Vec::new())).is_err() {
+            // A full queue means the client is not draining; the pump notices
+            // via the socket. Only a closed channel ends this task.
+            if let Err(mpsc::error::TrySendError::Closed(_)) =
+                keepalive_tx.try_send(Message::Ping(Vec::new()))
+            {
                 break;
             }
         }
     });
 
-    let conn_id = uuid::Uuid::new_v4().to_string();
     // Force-close channel: a host kick/ban fires `kill_tx` (handed to the room on
     // join) and this connection's read loop stops.
     let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
-    let cfg = &state.config;
-    let mut conn = Conn {
-        state: state.clone(),
-        conn_id: conn_id.clone(),
-        out: out_tx.clone(),
-        kill_tx: Some(kill_tx),
-        room_id: None,
-        client_id: None,
-        user,
-        chat_bucket: TokenBucket::new(cfg.chat_bucket.capacity, cfg.chat_bucket.refill_per_sec),
-        reaction_bucket: TokenBucket::new(
-            cfg.reaction_bucket.capacity,
-            cfg.reaction_bucket.refill_per_sec,
-        ),
-        global_bucket: TokenBucket::new(
-            cfg.global_bucket.capacity,
-            cfg.global_bucket.refill_per_sec,
-        ),
-        heavy_bucket: TokenBucket::new(cfg.heavy_bucket.capacity, cfg.heavy_bucket.refill_per_sec),
-    };
+    let mut conn = Conn::new(state.clone(), out_tx.clone(), kill_tx, user);
 
     // Hand the client its connection id up front.
     conn.send(ServerMsg::Welcome {
-        conn_id: conn_id.clone(),
+        conn_id: conn.conn_id.clone(),
     });
 
     loop {
@@ -176,7 +204,7 @@ async fn connection(socket: WebSocket, state: SharedState, user: Option<AuthedUs
             // Kicked/banned by the host: tell the client to close, then stop
             // reading. The Kicked frame was already queued by the moderator.
             _ = &mut kill_rx => {
-                let _ = conn.out.send(Message::Close(None));
+                let _ = conn.out.try_send(Message::Close(None));
                 break;
             }
         }
@@ -190,11 +218,26 @@ async fn connection(socket: WebSocket, state: SharedState, user: Option<AuthedUs
     drop(conn);
     drop(out_tx);
     let _ = keepalive.await;
-    let _ = timeout(Duration::from_secs(2), send_task).await;
+    // `timeout` only stops WAITING for the task -- it does not stop the task.
+    // Any sender clone still held elsewhere (a ConnHandle left in a room) kept
+    // out_rx.recv() alive, so the pump and its socket leaked for the process
+    // lifetime. Bound the drain, then abort for real.
+    if timeout(Duration::from_secs(2), &mut send_task).await.is_err() {
+        send_task.abort();
+    }
 }
 
 impl Conn {
     async fn handle(&mut self, msg: ClientMsg) {
+        // One flood guard in front of every intent, so no handler can forget
+        // it. Several did: set_rate, lock_room, set_persistent and queue_skip
+        // each post a system message to the room, and ran unthrottled — one
+        // socket could bury a room's chat as fast as it could write frames.
+        // Chat and reactions keep their own, tighter buckets on top of this;
+        // intents that spawn ffmpeg or touch the database charge the heavy one.
+        if !self.allow() {
+            return;
+        }
         match msg {
             ClientMsg::JoinRoom {
                 room_id,
@@ -227,8 +270,10 @@ impl Conn {
             ClientMsg::QueueRemove { index } => self.on_queue_remove(index).await,
             ClientMsg::QueueMove { from, to } => self.on_queue_move(from, to).await,
             ClientMsg::QueueSkip { ended_media } => self.on_queue_skip(ended_media).await,
+            ClientMsg::QueuePlay { index } => self.on_queue_play(index).await,
             ClientMsg::KickUser { client_id } => self.on_moderate(client_id, false).await,
             ClientMsg::BanUser { client_id } => self.on_moderate(client_id, true).await,
+            ClientMsg::TransferHost { client_id } => self.on_transfer_host(client_id).await,
             ClientMsg::LockRoom { locked } => self.on_lock_room(locked).await,
             ClientMsg::SetPersistent { persistent } => self.on_set_persistent(persistent).await,
             ClientMsg::MediaTitle { title } => self.on_media_title(title).await,
@@ -251,7 +296,30 @@ impl Conn {
         host_token: Option<String>,
         seat_token: Option<String>,
     ) {
+        // Each join costs a database lookup, and a re-join tears the previous
+        // seat down first; bounded like the other expensive intents.
+        if !self.allow_heavy() {
+            return self.send(ServerMsg::JoinError {
+                error: "Too many join attempts — slow down".to_string(),
+            });
+        }
         let room_id = room_id.trim().to_string();
+        // A socket that already holds a seat must release it before taking
+        // another. Without this, every join_room minted an ADDITIONAL User
+        // (claim_seat hands out a fresh `g-…` id when the requested one is
+        // occupied without a matching secret) while cleanup only ever tidied
+        // the last one. 50 joins on one socket then a disconnect left 49 users
+        // stuck at disconnected:false, so live_user_count() never reached 0:
+        // the room, its ffmpeg child and its /dev/shm/streams dir leaked
+        // permanently, and the room stayed "full" forever. Pointed at a
+        // registered slug -- which any anonymous visitor can hydrate -- that
+        // permanently bricked someone else's custom room URL.
+        //
+        // This also covers moving between rooms, which used to leave a live
+        // ConnHandle behind in the old room's `connections` map for good.
+        if self.client_id.is_some() {
+            self.cleanup().await;
+        }
         // Signed-in joiners with no explicit nickname get their account display
         // name — decided before sanitizing, which turns empty into "guest".
         let raw_nick = {
@@ -328,13 +396,17 @@ impl Conn {
 
         // Host status is granted by the room's secret host_token, by being the
         // first user in, or — in registered rooms — by being the signed-in
-        // owner, who reclaims host on every join even if it migrated away.
-        // Never by simply claiming a client_id (which is public).
+        // owner, who reclaims host on arrival even if it migrated away. Only on
+        // arrival: a reconnect of a still-held seat keeps whatever host status
+        // that seat has, or an owner who handed host to a friend would snatch
+        // it straight back on their next network blip. Never by simply
+        // claiming a client_id (which is public).
         let is_owner = matches!(
             (&self.user, room.owner_id),
             (Some(u), Some(owner)) if u.id == owner
         );
-        if is_owner || room.host_client_id.is_none() || room.is_host_token(&host_token) {
+        let owner_arrives = is_owner && !reconnected;
+        if owner_arrives || room.host_client_id.is_none() || room.is_host_token(&host_token) {
             room.set_host(&client_id);
         }
 
@@ -396,21 +468,10 @@ impl Conn {
         room.system_message(format!("{nick} changed the video"), history_limit);
         room.broadcast_state(Some(self.conn_id.clone()));
         drop(rooms);
-        match proxy {
-            // Non-YouTube → (re)spawn the server-side HLS stream.
-            Some((generation, offset, m)) => {
-                start_proxy_stream(self.state.clone(), room_id.clone(), m, generation, offset)
-            }
-            // YouTube → IFrame path; tear down any ffmpeg/RAM-disk state.
-            None => self.state.streams.stop(&room_id).await,
-        }
-        self.spawn_enrich(room_id, media);
+        self.start_media(room_id, media, proxy).await;
     }
 
     async fn on_play_pause(&mut self, paused: bool, current_time: Option<f64>) {
-        if !self.allow() {
-            return;
-        }
         self.with_room_unlocked(|room, conn_id| {
             if room.video.media.is_none() {
                 return;
@@ -422,9 +483,6 @@ impl Conn {
     }
 
     async fn on_seek(&mut self, current_time: f64) {
-        if !self.allow() {
-            return;
-        }
         if !(current_time.is_finite() && current_time >= 0.0) {
             return;
         }
@@ -437,8 +495,9 @@ impl Conn {
             if room.video.media.is_none() {
                 return;
             }
-            let paused = room.video.paused;
-            room.update_video_state(Some(paused), Some(current_time));
+            // `None`: a seek keeps the pause state, including a wait for
+            // buffering viewers (see update_video_state).
+            room.update_video_state(None, Some(current_time));
             room.broadcast_state(Some(conn_id));
         })
         .await;
@@ -464,9 +523,6 @@ impl Conn {
     }
 
     async fn on_buffering(&mut self, buffering: bool) {
-        if !self.allow() {
-            return;
-        }
         let (Some(room_id), Some(client_id)) = (self.room_id.clone(), self.client_id.clone()) else {
             return;
         };
@@ -476,7 +532,12 @@ impl Conn {
             return;
         }
         if let BufferOutcome::Changed = room.set_buffering(&client_id, buffering) {
-            room.broadcast_state(Some(self.conn_id.clone()));
+            // Deliberately no `caused_by`. An auto-pause/resume is the server's
+            // decision, not this viewer's intent, and the viewer it waited for
+            // needs the new state as much as anyone: tagged with its own
+            // conn_id, it discarded the resume as an echo and sat paused until
+            // the next heartbeat, up to HEARTBEAT_MS behind everyone else.
+            room.broadcast_state(None);
         }
     }
 
@@ -535,6 +596,15 @@ impl Conn {
     }
 
     async fn on_queue_skip(&mut self, ended_media: Option<String>) {
+        // A skip can spawn ffmpeg for the next item. Auto-advance skips (one
+        // per viewer at the end of every video) fit easily; only a manual
+        // flood hears about it.
+        if !self.allow_heavy() {
+            if ended_media.is_none() {
+                self.send(err("You're skipping too fast — slow down"));
+            }
+            return;
+        }
         let (Some(room_id), Some(client_id)) = (self.room_id.clone(), self.client_id.clone()) else {
             return;
         };
@@ -561,13 +631,7 @@ impl Conn {
                 room.system_message(format!("{nick} skipped to the next video"), history_limit);
                 room.broadcast_state(Some(self.conn_id.clone()));
                 drop(rooms);
-                match proxy {
-                    Some((generation, offset, m)) => {
-                        start_proxy_stream(self.state.clone(), room_id.clone(), m, generation, offset)
-                    }
-                    None => self.state.streams.stop(&room_id).await,
-                }
-                self.spawn_enrich(room_id, next);
+                self.start_media(room_id, next, proxy).await;
             }
             None => {
                 room.clear_media();
@@ -577,6 +641,29 @@ impl Conn {
                 self.state.streams.stop(&room_id).await;
             }
         }
+    }
+
+    /// Jump to a queued item: it leaves the queue and becomes the current video.
+    async fn on_queue_play(&mut self, index: i64) {
+        if !self.allow_heavy() {
+            return self.send(err("You're changing the video too fast — slow down"));
+        }
+        let (Some(room_id), Some(client_id)) = (self.room_id.clone(), self.client_id.clone()) else {
+            return;
+        };
+        let history_limit = self.cfg().chat_history_limit;
+        let mut rooms = self.state.rooms.write().await;
+        let Some(room) = rooms.get_mut(&room_id) else { return };
+        if !room.is_host(&client_id) && room.locked {
+            return self.send(err("Locked"));
+        }
+        let Some(next) = room.dequeue_at(index) else { return };
+        let nick = nick_of(room, &client_id);
+        let proxy = install_media(&self.state, room, next.clone());
+        room.system_message(format!("{nick} played a video from the queue"), history_limit);
+        room.broadcast_state(Some(self.conn_id.clone()));
+        drop(rooms);
+        self.start_media(room_id, next, proxy).await;
     }
 
     async fn on_lock_room(&mut self, locked: bool) {
@@ -641,9 +728,14 @@ impl Conn {
             "You were removed by the host"
         };
         if let Some(handle) = room.connections.get_mut(&target_conn) {
+            // try_send, not send: tokio's `send` is async, and the future it
+            // returned used to be dropped unpolled, so this frame was never
+            // queued at all. The kicked client saw only a dropped socket,
+            // auto-reconnected and was straight back in the room — a kick
+            // did nothing, and a ban showed the generic rejoin error.
             let _ = handle
                 .out
-                .send(Message::Text(ServerMsg::Kicked { reason: reason.to_string() }.to_json()));
+                .try_send(Message::Text(ServerMsg::Kicked { reason: reason.to_string() }.to_json()));
             if let Some(kill) = handle.kill.take() {
                 let _ = kill.send(());
             }
@@ -658,6 +750,28 @@ impl Conn {
         // A departing user may have been the only one buffering.
         room.reconcile_auto_pause();
         room.broadcast_state(None);
+    }
+
+    /// Host-only: make another connected user the host.
+    async fn on_transfer_host(&mut self, target: String) {
+        let (Some(room_id), Some(client_id)) = (self.room_id.clone(), self.client_id.clone()) else {
+            return;
+        };
+        let Some(target) = sanitize_client_id(&target) else { return };
+        if target == client_id {
+            return;
+        }
+        let history_limit = self.cfg().chat_history_limit;
+        let mut rooms = self.state.rooms.write().await;
+        let Some(room) = rooms.get_mut(&room_id) else { return };
+        if !room.is_host(&client_id) {
+            return;
+        }
+        let Some(nick) = room.transfer_host(&target) else {
+            return self.send(err("That user is no longer in the room"));
+        };
+        room.system_message(format!("{nick} is now the host"), history_limit);
+        room.broadcast_state(Some(self.conn_id.clone()));
     }
 
     async fn on_media_title(&mut self, title: String) {
@@ -739,9 +853,6 @@ impl Conn {
     }
 
     async fn on_typing(&mut self, typing: bool) {
-        if !self.allow() {
-            return;
-        }
         let Some(room_id) = self.room_id.clone() else { return };
         let Some(client_id) = self.client_id.clone() else { return };
         let rooms = self.state.rooms.read().await;
@@ -778,6 +889,20 @@ impl Conn {
             return;
         }
         f(room, self.conn_id.clone());
+    }
+
+    /// With the rooms lock released after `install_media`: bring the server-side
+    /// stream in line with the new current media, and resolve its title.
+    async fn start_media(&self, room_id: String, media: Media, proxy: Option<(u64, f64, Media)>) {
+        match proxy {
+            // Non-YouTube → (re)spawn the server-side HLS stream.
+            Some((generation, offset, m)) => {
+                start_proxy_stream(self.state.clone(), room_id.clone(), m, generation, offset)
+            }
+            // YouTube → IFrame path; tear down any ffmpeg/RAM-disk state.
+            None => self.state.streams.stop(&room_id).await,
+        }
+        self.spawn_enrich(room_id, media);
     }
 
     /// Resolve a YouTube title in the background and rebroadcast when it lands.
@@ -833,9 +958,21 @@ impl Conn {
         let (Some(room_id), Some(client_id)) = (self.room_id.clone(), self.client_id.clone()) else {
             return;
         };
+        // Forget the seat up front: whichever branch we leave by, this socket
+        // no longer holds it, and a stale room_id/client_id would make a later
+        // cleanup touch a seat that is not ours.
+        self.room_id = None;
+        self.client_id = None;
+
         let mut rooms = self.state.rooms.write().await;
         let Some(room) = rooms.get_mut(&room_id) else { return };
-        room.connections.remove(&self.conn_id);
+        // Take the kill channel back so a subsequent join can re-register it.
+        // It is a oneshot, so without this a second join stored `None` and the
+        // host could no longer force-close the socket -- kick/ban was evadable
+        // by simply joining twice.
+        if let Some(handle) = room.connections.remove(&self.conn_id) {
+            self.kill_tx = handle.kill;
+        }
 
         // Stale socket from a same-client takeover (a newer tab won the seat).
         match room.users.get(&client_id) {
@@ -1035,4 +1172,239 @@ pub fn spawn_heartbeat(state: SharedState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::AppState;
+    use serde_json::Value;
+
+    async fn test_state() -> SharedState {
+        // One connection: every connection to `sqlite::memory:` is its own DB.
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        sqlx::migrate!("./migrations").run(&db).await.expect("migrations");
+        Arc::new(AppState::new(Config::from_env(), db))
+    }
+
+    /// A connection driven directly through `Conn::handle`, with its outbound
+    /// queue and force-close channel kept for inspection.
+    struct Client {
+        conn: Conn,
+        rx: mpsc::Receiver<Message>,
+        kill_rx: oneshot::Receiver<()>,
+    }
+
+    impl Client {
+        async fn join(state: &SharedState, room: &str, id: &str) -> Client {
+            Client::join_as(state, room, id, None, None).await
+        }
+
+        async fn join_as(
+            state: &SharedState,
+            room: &str,
+            id: &str,
+            user: Option<AuthedUser>,
+            seat_token: Option<String>,
+        ) -> Client {
+            let (out, rx) = mpsc::channel(OUT_QUEUE_DEPTH);
+            let (kill_tx, kill_rx) = oneshot::channel();
+            let mut client = Client { conn: Conn::new(state.clone(), out, kill_tx, user), rx, kill_rx };
+            client
+                .send(ClientMsg::JoinRoom {
+                    room_id: room.to_string(),
+                    nickname: Some(id.to_string()),
+                    client_id: Some(id.to_string()),
+                    host_token: None,
+                    seat_token,
+                })
+                .await;
+            client
+        }
+
+        async fn send(&mut self, msg: ClientMsg) {
+            self.conn.handle(msg).await;
+        }
+
+        /// Every text frame queued so far, parsed.
+        fn frames(&mut self) -> Vec<Value> {
+            let mut out = Vec::new();
+            while let Ok(msg) = self.rx.try_recv() {
+                if let Message::Text(text) = msg {
+                    out.push(serde_json::from_str(&text).expect("frames are JSON"));
+                }
+            }
+            out
+        }
+    }
+
+    fn of_type<'a>(frames: &'a [Value], kind: &str) -> Vec<&'a Value> {
+        frames.iter().filter(|f| f["type"] == kind).collect()
+    }
+
+    fn youtube(id: &str) -> ClientMsg {
+        // A title up front keeps spawn_enrich off the network.
+        ClientMsg::QueueAdd {
+            url: format!("https://www.youtube.com/watch?v={id}"),
+            title: Some(format!("video {id}")),
+            is_live: None,
+        }
+    }
+
+    /// Regression: the Kicked frame was built with tokio's async `send` and
+    /// the future dropped unpolled, so it never went out; the kicked client
+    /// saw a plain disconnect and reconnected straight back into the room.
+    #[tokio::test]
+    async fn kick_tells_the_target_before_closing_its_socket() {
+        let state = test_state().await;
+        let (room, _) = state.create_room().await.unwrap();
+        let mut host = Client::join(&state, &room, "host-0001").await;
+        let mut guest = Client::join(&state, &room, "guest-001").await;
+        guest.frames();
+
+        host.send(ClientMsg::KickUser { client_id: "guest-001".into() }).await;
+
+        let frames = guest.frames();
+        let kicked = of_type(&frames, "kicked");
+        assert_eq!(kicked.len(), 1, "got {frames:?}");
+        assert_eq!(kicked[0]["reason"], "You were removed by the host");
+        assert!(guest.kill_rx.try_recv().is_ok(), "the socket is force-closed");
+        assert!(!state.rooms.read().await[&room].users.contains_key("guest-001"));
+    }
+
+    #[tokio::test]
+    async fn a_ban_blocks_the_rejoin() {
+        let state = test_state().await;
+        let (room, _) = state.create_room().await.unwrap();
+        let mut host = Client::join(&state, &room, "host-0001").await;
+        let mut guest = Client::join(&state, &room, "guest-001").await;
+        host.send(ClientMsg::BanUser { client_id: "guest-001".into() }).await;
+        assert_eq!(of_type(&guest.frames(), "kicked")[0]["reason"], "You were banned by the host");
+
+        let mut again = Client::join(&state, &room, "guest-001").await;
+        assert_eq!(of_type(&again.frames(), "join_error").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_the_host_moderates() {
+        let state = test_state().await;
+        let (room, _) = state.create_room().await.unwrap();
+        let _host = Client::join(&state, &room, "host-0001").await;
+        let mut guest = Client::join(&state, &room, "guest-001").await;
+        guest.send(ClientMsg::KickUser { client_id: "host-0001".into() }).await;
+        assert!(state.rooms.read().await[&room].users.contains_key("host-0001"));
+    }
+
+    #[tokio::test]
+    async fn host_can_be_handed_over() {
+        let state = test_state().await;
+        let (room, _) = state.create_room().await.unwrap();
+        let mut host = Client::join(&state, &room, "host-0001").await;
+        let mut guest = Client::join(&state, &room, "guest-001").await;
+
+        host.send(ClientMsg::TransferHost { client_id: "guest-001".into() }).await;
+        assert!(state.rooms.read().await[&room].is_host("guest-001"));
+
+        // The former host lost the controls that come with it.
+        host.send(ClientMsg::KickUser { client_id: "guest-001".into() }).await;
+        assert!(state.rooms.read().await[&room].users.contains_key("guest-001"));
+        // A non-host cannot hand host around.
+        host.send(ClientMsg::TransferHost { client_id: "host-0001".into() }).await;
+        assert!(state.rooms.read().await[&room].is_host("guest-001"));
+        let frames = guest.frames();
+        assert!(of_type(&frames, "system_message")
+            .iter()
+            .any(|m| m["text"] == "guest-001 is now the host"));
+    }
+
+    #[tokio::test]
+    async fn queue_play_jumps_to_that_item() {
+        let state = test_state().await;
+        let (room, _) = state.create_room().await.unwrap();
+        let mut host = Client::join(&state, &room, "host-0001").await;
+        host.send(youtube("aaaaaaaaaaa")).await;
+        host.send(youtube("bbbbbbbbbbb")).await;
+        host.send(youtube("ccccccccccc")).await;
+
+        host.send(ClientMsg::QueuePlay { index: 1 }).await;
+        let rooms = state.rooms.read().await;
+        let r = &rooms[&room];
+        assert_eq!(r.video.media.as_ref().unwrap().id.as_deref(), Some("bbbbbbbbbbb"));
+        let left: Vec<_> = r.queue.iter().map(|m| m.id.clone().unwrap()).collect();
+        assert_eq!(left, ["aaaaaaaaaaa", "ccccccccccc"]);
+    }
+
+    #[tokio::test]
+    async fn queue_play_respects_the_lock_and_bounds() {
+        let state = test_state().await;
+        let (room, _) = state.create_room().await.unwrap();
+        let mut host = Client::join(&state, &room, "host-0001").await;
+        let mut guest = Client::join(&state, &room, "guest-001").await;
+        host.send(youtube("aaaaaaaaaaa")).await;
+        host.send(ClientMsg::LockRoom { locked: true }).await;
+
+        guest.send(ClientMsg::QueuePlay { index: 0 }).await;
+        host.send(ClientMsg::QueuePlay { index: 7 }).await;
+        let rooms = state.rooms.read().await;
+        assert!(rooms[&room].video.media.is_none());
+        assert_eq!(rooms[&room].queue.len(), 1);
+    }
+
+    /// set_rate posts a system message, and used to skip the flood guard.
+    #[tokio::test]
+    async fn every_intent_is_flood_guarded() {
+        let state = test_state().await;
+        let (room, _) = state.create_room().await.unwrap();
+        let mut host = Client::join(&state, &room, "host-0001").await;
+        host.send(youtube("aaaaaaaaaaa")).await;
+        host.send(ClientMsg::QueueSkip { ended_media: None }).await;
+        for i in 0..200 {
+            let rate = if i % 2 == 0 { 1.5 } else { 1.0 };
+            host.send(ClientMsg::SetRate { rate }).await;
+        }
+        let rooms = state.rooms.read().await;
+        let speed_changes = rooms[&room]
+            .chat_history
+            .iter()
+            .filter(|e| e.text.contains("set speed"))
+            .count();
+        let cap = state.config.global_bucket.capacity as usize;
+        assert!(speed_changes > 0 && speed_changes <= cap, "{speed_changes} speed changes");
+    }
+
+    /// A registered room's owner reclaims host when they arrive, but not when
+    /// a seat they still hold reconnects — or a hand-over would not stick.
+    #[tokio::test]
+    async fn owner_reclaims_host_on_arrival_but_not_on_reconnect() {
+        let state = test_state().await;
+        let owner_id = match db::create_user(&state.db, "owner", "Owner", "x", 0).await.unwrap() {
+            db::CreateUserOutcome::Created(id) => id,
+            db::CreateUserOutcome::UsernameTaken => unreachable!(),
+        };
+        db::claim_slug(&state.db, "movie-night", owner_id, 0, 5).await.unwrap();
+        let account = AuthedUser {
+            id: owner_id,
+            username: "owner".into(),
+            display_name: "Owner".into(),
+            color: None,
+        };
+
+        let mut owner = Client::join_as(&state, "movie-night", "owner-001", Some(account.clone()), None).await;
+        let seat = of_type(&owner.frames(), "joined")[0]["seat_token"].as_str().unwrap().to_string();
+        let _friend = Client::join(&state, "movie-night", "friend-01").await;
+        owner.send(ClientMsg::TransferHost { client_id: "friend-01".into() }).await;
+
+        // A blip: the same seat reconnects on a new socket.
+        let _back = Client::join_as(&state, "movie-night", "owner-001", Some(account.clone()), Some(seat)).await;
+        assert!(state.rooms.read().await["movie-night"].is_host("friend-01"));
+
+        // Arriving afresh (the old seat is gone) makes the owner host again.
+        state.rooms.write().await.get_mut("movie-night").unwrap().remove_user("owner-001");
+        let _later = Client::join_as(&state, "movie-night", "owner-001", Some(account), None).await;
+        assert!(state.rooms.read().await["movie-night"].is_host("owner-001"));
+    }
 }

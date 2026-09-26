@@ -30,9 +30,26 @@ export interface Player {
   getRate(): number;
   isPaused(): boolean;
   isSeeking(): boolean;
+  /** At the end of the media. Such a player must not be told to "play": both
+   *  adapters would restart from 0 rather than resume. */
+  isEnded(): boolean;
   getTitle(): string | null;
   applyState(state: VideoStateApply): void | Promise<void>;
+  /** Set the playback rate programmatically. Must NOT surface as a `ratechange`
+   *  intent — the sync engine calls this to track the room and to nudge the rate
+   *  while closing drift, and neither is the viewer asking for a speed change. */
   setRate(rate: number): void;
+  /** True when arbitrary fractional rates are usable, so the engine can close
+   *  small drift by playing slightly fast/slow instead of seeking. False for
+   *  players that snap to a fixed list of speeds (YouTube). */
+  canNudgeRate(): boolean;
+  /** Whether `time` is buffered well enough to play from right now. Guards the
+   *  engine against "correcting" into a hole: for the server-side HLS proxy the
+   *  room's position can be ahead of what ffmpeg has muxed, and seeking there
+   *  and playing on just stalls. When this is false the engine holds the room
+   *  and waits at that position, paused, until it turns true. Players that
+   *  manage their own buffer and handle arbitrary seeks return true. */
+  canPlayAt(time: number): boolean;
   setEnabled(enabled: boolean): void;
   toggleMute(): boolean;
   setVolume(v: number): void;

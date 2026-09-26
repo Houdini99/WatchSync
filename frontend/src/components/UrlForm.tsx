@@ -5,13 +5,14 @@ export default function UrlForm() {
   const [url, setUrl] = useState('');
   const [busy, setBusy] = useState(false);
 
-  async function run(action: (u: string) => Promise<void>) {
+  async function run(action: (u: string) => Promise<boolean>) {
     const v = url.trim();
     if (!v || busy) return;
     setBusy(true);
     try {
-      await action(v);
-      setUrl('');
+      // Only clear on a send that actually left the browser — clearing on a
+      // dropped send loses what the user typed and looks like it worked.
+      if (await action(v)) setUrl('');
     } finally {
       setBusy(false);
     }
@@ -26,7 +27,14 @@ export default function UrlForm() {
       className="flex gap-2"
     >
       <input
-        type="url"
+        // Not type="url": that made the browser refuse `youtube.com/watch?v=…`
+        // (no scheme) on Enter, while the Queue button, which skips form
+        // validation, sent it anyway. The client adds https:// itself.
+        type="text"
+        inputMode="url"
+        autoComplete="off"
+        spellCheck={false}
+        aria-label="Video URL"
         value={url}
         disabled={busy}
         onChange={(e) => setUrl(e.target.value)}

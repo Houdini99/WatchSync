@@ -74,33 +74,33 @@ export default function TopBar() {
         <SpeedMenu rate={rate} />
 
         {showPip && (
-          <button className={iconBtn} title="Picture-in-picture" onClick={() => client.player?.togglePiP()}>
+          <button className={iconBtn} aria-label="Picture-in-picture" title="Picture-in-picture" onClick={() => client.player?.togglePiP()}>
             ⧉
           </button>
         )}
-        <button className={`${iconBtn} ${resyncing ? 'spinning' : ''}`} title="Resync to room" onClick={resync} disabled={resyncing}>
+        <button className={`${iconBtn} ${resyncing ? 'spinning' : ''}`} aria-label="Resync to room" title="Resync to room" onClick={resync} disabled={resyncing}>
           ⟳
         </button>
         <button
           className={`${iconBtn} ${soundEnabled ? '' : 'opacity-40'}`}
-          title="Toggle chat sound"
+          aria-label="Toggle chat sound" title="Toggle chat sound"
           onClick={() => useStore.getState().toggleSound()}
         >
           {soundEnabled ? '🔔' : '🔕'}
         </button>
         <button
           className={iconBtn}
-          title="Toggle theme"
+          aria-label="Toggle theme" title="Toggle theme"
           onClick={() => useStore.getState().setTheme(theme === 'light' ? 'dark' : 'light')}
         >
           {theme === 'light' ? '☀️' : '🌙'}
         </button>
-        <button className={iconBtn} title="Fullscreen (F)" onClick={() => toggleFullscreen()}>
+        <button className={iconBtn} aria-label="Fullscreen (F)" title="Fullscreen (F) — press ? for all shortcuts" onClick={() => toggleFullscreen()}>
           ⛶
         </button>
         <button
           className="rounded-md border border-border bg-transparent px-3 py-1.5 text-sm transition hover:bg-surface2"
-          title="Copy invite link"
+          aria-label="Copy invite link" title="Copy invite link"
           onClick={copyLink}
         >
           Copy link
@@ -158,7 +158,7 @@ function SpeedMenu({ rate }: { rate: number }) {
     <div className="relative" ref={wrapRef}>
       <button
         className={`${iconBtn} min-w-[2.6em] font-mono text-xs ${rate !== 1 ? 'border-accent bg-accent text-white' : ''}`}
-        title="Playback speed"
+        aria-label="Playback speed" title="Playback speed"
         onClick={() => {
           if (locked && !isHost) return useStore.getState().showToast('Host has locked controls');
           setOpen((o) => !o);

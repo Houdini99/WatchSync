@@ -5,8 +5,16 @@
 
 /// Strip `<...>` tags and ASCII/C1 control characters, trim, then cap length
 /// (by Unicode scalar values, not bytes).
+///
+/// The length cap is applied FIRST, not last. Every step below allocates a
+/// fresh String the size of its input, so capping at the end meant a 64 MB
+/// frame (axum's default max_message_size) cost ~200 MB of transient
+/// allocation before being truncated to a 32-character nickname. The cap is
+/// generous -- 4x max_len -- so that tags and control characters stripped
+/// later cannot push legitimate input over the limit.
 pub fn sanitize_text(input: &str, max_len: usize) -> String {
-    let no_tags = strip_tags(input);
+    let bounded: String = input.chars().take(max_len.saturating_mul(4)).collect();
+    let no_tags = strip_tags(&bounded);
     let cleaned: String = no_tags.chars().filter(|c| !is_control_like(*c)).collect();
     let trimmed = cleaned.trim();
     trimmed.chars().take(max_len).collect()
@@ -88,4 +96,44 @@ fn strip_tags(input: &str) -> String {
 fn is_control_like(c: char) -> bool {
     let n = c as u32;
     n <= 0x1f || (0x7f..=0x9f).contains(&n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caps_length_by_scalar_values() {
+        assert_eq!(sanitize_text("abcdef", 3), "abc");
+        assert_eq!(sanitize_text("héllo wörld", 5).chars().count(), 5);
+    }
+
+    /// The pre-cap must not change results for input within the limit, even
+    /// when most of it is stripped as tags or control characters.
+    #[test]
+    fn early_cap_does_not_truncate_legitimate_input() {
+        let noisy = "<b><i><em><strong>hi</strong></em></i></b>";
+        assert_eq!(sanitize_text(noisy, 8), "hi");
+        let controls = "a\u{0}\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}\u{7}b";
+        assert_eq!(sanitize_text(controls, 4), "ab");
+    }
+
+    #[test]
+    fn huge_input_is_bounded_and_still_correct() {
+        let huge = "x".repeat(1_000_000);
+        assert_eq!(sanitize_text(&huge, 32).chars().count(), 32);
+    }
+
+    #[test]
+    fn strips_tags_and_controls() {
+        assert_eq!(sanitize_text("<script>alert(1)</script>hi", 64), "alert(1)hi");
+        assert_eq!(sanitize_text("  spaced  ", 64), "spaced");
+    }
+
+    #[test]
+    fn nickname_falls_back_to_guest() {
+        assert_eq!(sanitize_nickname("   ", 32), "guest");
+        assert_eq!(sanitize_nickname("<>", 32), "guest");
+        assert_eq!(sanitize_nickname("Ada", 32), "Ada");
+    }
 }

@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { client } from '../client';
+import { splitTimestamps } from '../lib/timestamps';
 import { useStore } from '../store';
 import type { ChatItem } from '../types';
 
@@ -10,15 +11,36 @@ function formatTime(ts: number) {
   return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-// Render message text with bare URLs turned into links. React escapes the text
-// nodes, so this is XSS-safe without any extra sanitization.
-function renderBody(text: string) {
+// Render message text with bare URLs turned into links and, when the room has
+// a seekable video, timestamps ("look at 12:34") turned into jump buttons.
+// React escapes the text nodes, so this is XSS-safe without extra sanitization.
+function renderBody(text: string, seekable: boolean) {
   const parts: React.ReactNode[] = [];
-  let last = 0;
   let key = 0;
+  const plain = (run: string) => {
+    if (!seekable) return parts.push(<Fragment key={key++}>{run}</Fragment>);
+    for (const piece of splitTimestamps(run)) {
+      if (typeof piece === 'string') {
+        parts.push(<Fragment key={key++}>{piece}</Fragment>);
+      } else {
+        parts.push(
+          <button
+            key={key++}
+            type="button"
+            onClick={() => client.jumpTo(piece.seconds)}
+            title={`Jump to ${piece.label}`}
+            className="font-mono text-accent-hover underline decoration-dotted underline-offset-2 hover:decoration-solid"
+          >
+            {piece.label}
+          </button>,
+        );
+      }
+    }
+  };
+  let last = 0;
   for (const m of text.matchAll(URL_RE)) {
     const idx = m.index ?? 0;
-    if (idx > last) parts.push(<Fragment key={key++}>{text.slice(last, idx)}</Fragment>);
+    if (idx > last) plain(text.slice(last, idx));
     parts.push(
       <a key={key++} href={m[0]} target="_blank" rel="noopener noreferrer" className="text-accent-hover underline">
         {m[0]}
@@ -26,13 +48,14 @@ function renderBody(text: string) {
     );
     last = idx + m[0].length;
   }
-  if (last < text.length) parts.push(<Fragment key={key++}>{text.slice(last)}</Fragment>);
+  if (last < text.length) plain(text.slice(last));
   return parts;
 }
 
 export default function ChatPanel() {
   const chat = useStore((s) => s.chat);
   const typers = useStore((s) => s.typers);
+  const seekable = useStore((s) => !!s.media && !s.media.is_live);
   const logRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
 
@@ -64,11 +87,24 @@ export default function ChatPanel() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col p-3">
-      <div ref={logRef} onScroll={onScroll} className="flex flex-1 flex-col gap-2 overflow-y-auto pr-1">
-        {chat.map((m) => (m.kind === 'system' ? <SystemMsg key={m.id} text={m.text} /> : <ChatMsg key={m.id} m={m} />))}
+      <div
+        ref={logRef}
+        onScroll={onScroll}
+        role="log"
+        aria-live="polite"
+        aria-relevant="additions"
+        aria-label="Chat messages"
+        className="flex flex-1 flex-col gap-2 overflow-y-auto pr-1"
+      >
+        {chat.map((m) =>
+          m.kind === 'system' ? <SystemMsg key={m.id} text={m.text} /> : <ChatMsg key={m.id} m={m} seekable={seekable} />,
+        )}
       </div>
 
-      <div className={`min-h-[1.1em] py-0.5 text-xs italic text-dim transition-opacity ${typingText ? 'opacity-100' : 'opacity-0'}`}>
+      <div
+        aria-live="polite"
+        className={`min-h-[1.1em] py-0.5 text-xs italic text-dim transition-opacity ${typingText ? 'opacity-100' : 'opacity-0'}`}
+      >
         {typingText}
       </div>
 
@@ -89,7 +125,7 @@ export default function ChatPanel() {
   );
 }
 
-function ChatMsg({ m }: { m: ChatItem }) {
+function ChatMsg({ m, seekable }: { m: ChatItem; seekable: boolean }) {
   return (
     <div className={`relative break-words rounded-lg px-2.5 py-1.5 leading-snug ${m.mine ? 'bg-accent/15' : 'bg-surface2'}`}>
       <div className="mb-0.5 flex items-baseline gap-1.5">
@@ -98,7 +134,7 @@ function ChatMsg({ m }: { m: ChatItem }) {
         </span>
         <span className="font-mono text-[0.7rem] text-dim">{formatTime(m.ts)}</span>
       </div>
-      <div>{renderBody(m.text)}</div>
+      <div>{renderBody(m.text, seekable)}</div>
     </div>
   );
 }

@@ -55,6 +55,16 @@ body.room-open {
   overflow: hidden;
 }
 
+/* Inline literals in prose (privacy policy: storage keys, paths, hostnames). */
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  background: var(--bg-elev-2);
+  border-radius: 4px;
+  padding: 0.1em 0.35em;
+  overflow-wrap: anywhere;
+}
+
 /* Raw <video> / YouTube mount inside the player surface. Both are positioned
    absolutely so they overlay (never stack) — visibility is owned by React via
    inline `display`, so nothing here may force `display`, or it would override

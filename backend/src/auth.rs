@@ -6,6 +6,8 @@
 //! sessions. Passwords are argon2id, hashed off the async workers. Guests are
 //! untouched: every route here is additive and nothing else requires it.
 
+use axum::extract::ConnectInfo;
+use std::net::SocketAddr;
 use std::fmt::Write as _;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -94,9 +96,26 @@ pub fn unauthorized() -> Response {
 }
 
 /// Mint a session for `user` and answer with the cookie + user payload.
-async fn start_session(state: &SharedState, user: AuthedUser) -> Response {
+async fn start_session(state: &SharedState, user: AuthedUser, prev: Option<String>) -> Response {
     let raw = nanoid!(43); // 43 chars × 64-symbol alphabet ≈ 258 bits
     let token_hash = hash_token(&raw);
+    // Retire the session this request arrived with, if any. Signing in already
+    // mints a fresh random token (so a planted cookie is replaced, and
+    // fixation never had a foothold), but the row behind the OLD cookie used
+    // to be left valid until the 6-hourly purge — one orphaned, still-usable
+    // session per re-login on the same browser.
+    //
+    // Deliberately scoped to this one session, NOT every session for the
+    // account: signing in on a phone must not sign you out on a laptop.
+    if let Some(prev_raw) = prev {
+        let prev_hash = hash_token(&prev_raw);
+        if prev_hash != token_hash {
+            if let Err(e) = db::delete_session(&state.db, &prev_hash).await {
+                // Non-fatal: the new session works; the old row just lingers.
+                tracing::warn!("could not retire previous session: {e}");
+            }
+        }
+    }
     let now = now_ms() as i64;
     let ttl_secs = state.config.session_ttl_days as i64 * 86_400;
     if let Err(e) = db::insert_session(&state.db, &token_hash, user.id, now, now + ttl_secs * 1000).await
@@ -156,10 +175,15 @@ pub struct RegisterBody {
 
 pub async fn register(
     State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<RegisterBody>,
 ) -> Response {
-    if !state.auth_limiter.allow(&client_ip(&headers)).await {
+    if !state
+        .auth_limiter
+        .allow(&client_ip(&headers, peer.ip(), &state.config))
+        .await
+    {
         return too_many_requests();
     }
     if !state.config.registration_enabled {
@@ -195,7 +219,7 @@ pub async fn register(
         Ok(db::CreateUserOutcome::Created(id)) => {
             tracing::info!("account registered: {username}");
             let user = AuthedUser { id, username, display_name, color: None };
-            start_session(&state, user).await
+            start_session(&state, user, session_token(&headers)).await
         }
         Ok(db::CreateUserOutcome::UsernameTaken) => {
             err(StatusCode::CONFLICT, "That username is taken")
@@ -215,16 +239,28 @@ pub struct LoginBody {
 
 pub async fn login(
     State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Response {
-    if !state.auth_limiter.allow(&client_ip(&headers)).await {
+    if !state
+        .auth_limiter
+        .allow(&client_ip(&headers, peer.ip(), &state.config))
+        .await
+    {
         return too_many_requests();
     }
     let username = body.username.trim().to_ascii_lowercase();
     // Per-username throttle on top of the per-IP one, so a single account can't
     // be brute-forced from many IPs.
-    if !state.login_limiter.allow(&username).await {
+    //
+    // The key is TRUNCATED first. valid_username is never applied on the login
+    // path (an unknown user must still reach the dummy-hash branch, so we
+    // cannot reject early), which left the limiter keyed by up to axum's
+    // default 2 MB body limit — attacker-controlled, unbounded-length map keys
+    // in a global HashMap on the request path.
+    let limiter_key: String = username.chars().take(64).collect();
+    if !state.login_limiter.allow(&limiter_key).await {
         return too_many_requests();
     }
 
@@ -246,7 +282,7 @@ pub async fn login(
         Ok(true)
     );
     match user {
-        Some(user) if ok => start_session(&state, user).await,
+        Some(user) if ok => start_session(&state, user, session_token(&headers)).await,
         _ => err(StatusCode::UNAUTHORIZED, "Invalid username or password"),
     }
 }

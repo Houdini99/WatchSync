@@ -10,8 +10,10 @@
     />
     <title>WatchSync</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-    <!-- YouTube IFrame API (used by the YouTube player adapter). -->
-    <script src="https://www.youtube.com/iframe_api"></script>
+    <!-- The YouTube IFrame API is deliberately NOT loaded here. Fetching it on
+         every page load would hand Google each visitor's IP address before they
+         have played anything (see /privacy §7.1); the YouTube player adapter
+         injects it on demand instead — src/sync/players/YouTubePlayer.ts. -->
   </head>
   <body>
     <div id="root"></div>

@@ -184,12 +184,20 @@ pub enum ClientMsg {
         #[serde(default)]
         ended_media: Option<String>,
     },
+    /// Play the queue item at `index` now, taking it out of the queue.
+    QueuePlay {
+        index: i64,
+    },
     /// Host-only: remove a user from the room (they may rejoin).
     KickUser {
         client_id: String,
     },
     /// Host-only: remove a user and block their rejoin for the room's lifetime.
     BanUser {
+        client_id: String,
+    },
+    /// Host-only: hand host status to another connected user.
+    TransferHost {
         client_id: String,
     },
     LockRoom {
