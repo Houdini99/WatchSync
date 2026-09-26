@@ -12,6 +12,7 @@ import {
 } from './lib/identity';
 import { playPing } from './lib/sound';
 import { Socket } from './lib/socket';
+import { normalizeMediaUrl } from './lib/url';
 import { pickPlayer, type Player } from './sync/players';
 import { SyncEngine } from './sync/SyncEngine';
 import { nextId, useStore } from './store';
@@ -51,9 +52,19 @@ class WatchSyncClient {
 
   private mounts: { video: HTMLVideoElement; ytMount: HTMLElement } | null = null;
   private pingTimer: number | null = null;
+  private joinRetryTimer: number | null = null;
+  private readonly resyncTimers = new Set<number>();
   private ytTitlePoll: number | null = null;
   private typingTimers = new Map<string, number>();
   private resyncResolvers: Array<(ok: boolean) => void> = [];
+
+  /** Back from the background: if the browser paused us there while the room
+   *  played on, jump to where the room is now. */
+  private readonly onVisibility = () => {
+    if (document.visibilityState === 'visible' && this.sync?.needsResyncOnVisible()) {
+      void this.resync();
+    }
+  };
 
   // ---- connection lifecycle ----
 
@@ -97,6 +108,7 @@ class WatchSyncClient {
       storeSeatToken(this.roomId, m.seat_token);
       const store = useStore.getState();
       this.sync?.setDriftTolerance(m.config.drift_tolerance_sec);
+      this.sync?.onJoined();
       store.setConfig(m.config.allowed_rates, m.config.max_queue_length);
       if (!this.hasJoinedOnce) {
         store.setChat(m.chat_history.map((e) => this.toChatItem(e)));
@@ -127,7 +139,13 @@ class WatchSyncClient {
       if (this.hostToken && this.joinAttempts < MAX_JOIN_ATTEMPTS && this.socket?.isOpen) {
         this.joinAttempts++;
         useStore.getState().setStatus('Connecting…', true);
-        window.setTimeout(() => this.sendJoin(), JOIN_RETRY_MS);
+        // Tracked so disconnect() can cancel it. Untracked, this fired after a
+        // join to a DIFFERENT room and re-sent join_room using the mutated
+        // this.roomId/this.nickname on the new socket.
+        this.joinRetryTimer = window.setTimeout(() => {
+          this.joinRetryTimer = null;
+          this.sendJoin();
+        }, JOIN_RETRY_MS);
         return;
       }
       useStore.getState().setStatus(m.error, true);
@@ -172,6 +190,7 @@ class WatchSyncClient {
 
     socket.connect();
     this.startPinging();
+    document.addEventListener('visibilitychange', this.onVisibility);
   }
 
   private sendJoin() {
@@ -187,6 +206,18 @@ class WatchSyncClient {
 
   disconnect() {
     this.stopPinging();
+    document.removeEventListener('visibilitychange', this.onVisibility);
+    // Cancel every pending timer. These used to outlive the connection and
+    // fire against a reset store or a different room.
+    if (this.joinRetryTimer !== null) {
+      clearTimeout(this.joinRetryTimer);
+      this.joinRetryTimer = null;
+    }
+    this.resyncTimers.forEach(clearTimeout);
+    this.resyncTimers.clear();
+    this.resyncResolvers.splice(0).forEach((r) => r(false));
+    this.typingTimers.forEach(clearTimeout);
+    this.typingTimers.clear();
     this.socket?.close();
     this.socket = null;
     this.sync?.clearPlayer();
@@ -360,18 +391,31 @@ class WatchSyncClient {
   /** Load a URL now. The server resolves the source (yt-dlp) and mux/transcodes
    *  it to HLS on demand, so the client just sends the raw URL and the player
    *  waits for the proxy stream to become ready. */
-  async submitVideo(rawUrl: string) {
-    const url = rawUrl.trim();
-    if (!url) return;
-    this.socket?.send({ type: 'change_video', url });
+  async submitVideo(rawUrl: string): Promise<boolean> {
+    const url = normalizeMediaUrl(rawUrl);
+    if (!url) return false;
+    return this.sendOrWarn({ type: 'change_video', url });
   }
 
   /** Add a URL to the queue (the server resolves its title in the background). */
-  async submitToQueue(rawUrl: string) {
-    const url = rawUrl.trim();
-    if (!url) return;
-    this.socket?.send({ type: 'queue_add', url });
+  async submitToQueue(rawUrl: string): Promise<boolean> {
+    const url = normalizeMediaUrl(rawUrl);
+    if (!url) return false;
+    if (!this.sendOrWarn({ type: 'queue_add', url })) return false;
     useStore.getState().showToast('Added to queue');
+    return true;
+  }
+
+  /**
+   * Send, and tell the user when it did not go out. Socket.send drops silently
+   * while the socket is closed, so during the 0.5–8s reconnect backoff these
+   * actions used to look like they had worked: the input cleared and "Added to
+   * queue" appeared for a message that never left the browser.
+   */
+  private sendOrWarn(msg: Parameters<Socket['send']>[0]): boolean {
+    if (this.socket?.send(msg)) return true;
+    useStore.getState().setStatus('Not connected — action not sent', true);
+    return false;
   }
   queueRemove(index: number) {
     this.socket?.send({ type: 'queue_remove', index });
@@ -381,6 +425,10 @@ class WatchSyncClient {
   }
   queueSkip() {
     this.socket?.send({ type: 'queue_skip' });
+  }
+  /** Play a queued item now (it leaves the queue). */
+  queuePlay(index: number) {
+    this.sendOrWarn({ type: 'queue_play', index });
   }
   lockRoom(locked: boolean) {
     this.socket?.send({ type: 'lock_room', locked });
@@ -396,6 +444,20 @@ class WatchSyncClient {
   banUser(clientId: string) {
     this.socket?.send({ type: 'ban_user', client_id: clientId });
   }
+  /** Host-only: hand host status to another connected user. */
+  transferHost(clientId: string): boolean {
+    return this.sendOrWarn({ type: 'transfer_host', client_id: clientId });
+  }
+
+  /** Jump the room to a content second — a timestamp clicked in chat. */
+  jumpTo(seconds: number): boolean {
+    const { locked, isHost } = useStore.getState();
+    if (locked && !isHost) {
+      useStore.getState().showToast('Host has locked controls');
+      return false;
+    }
+    return !!this.sync?.jumpTo(seconds);
+  }
 
   /** Apply a speed change locally *and* tell the server (our echo is ignored,
    *  so without the local apply the originator's video would never change). */
@@ -410,7 +472,7 @@ class WatchSyncClient {
 
   sendChat(text: string) {
     const trimmed = text.trim();
-    if (trimmed) this.socket?.send({ type: 'chat_message', text: trimmed });
+    if (trimmed) this.sendOrWarn({ type: 'chat_message', text: trimmed });
   }
   sendReaction(emoji: string) {
     this.socket?.send({ type: 'reaction', emoji });
@@ -424,13 +486,15 @@ class WatchSyncClient {
       if (!this.socket?.isOpen) return resolve(false);
       this.resyncResolvers.push(resolve);
       this.socket.send({ type: 'sync_request' });
-      window.setTimeout(() => {
+      const tid = window.setTimeout(() => {
+        this.resyncTimers.delete(tid);
         const idx = this.resyncResolvers.indexOf(resolve);
         if (idx >= 0) {
           this.resyncResolvers.splice(idx, 1);
           resolve(false);
         }
       }, 3000);
+      this.resyncTimers.add(tid);
     });
   }
 
@@ -524,7 +588,15 @@ class WatchSyncClient {
 
   async createRoom(): Promise<string> {
     const res = await fetch('/api/rooms', { method: 'POST' });
-    if (!res.ok) throw new Error('Failed to create room');
+    if (!res.ok) {
+      // Surface the server's reason — it distinguishes "at room capacity"
+      // (503) and "too many requests" (429) from a generic failure.
+      const reason = await res
+        .json()
+        .then((b: { error?: string }) => b?.error)
+        .catch(() => undefined);
+      throw new Error(reason || 'Failed to create room');
+    }
     const { id, hostToken } = (await res.json()) as { id: string; hostToken: string };
     storeHostToken(id, hostToken);
     return id;

@@ -17,7 +17,7 @@ use axum::extract::ws::Message;
 use nanoid::nanoid;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tokio::sync::{oneshot, Mutex, RwLock};
 
 /// Max distinct client_ids a single room may keep banned, so a host cannot grow
@@ -79,12 +79,15 @@ pub struct User {
     pub color: String,
     pub buffering: bool,
     pub disconnected: bool,
+    /// Order of arrival in the room, for a stable user list. `users` is a
+    /// HashMap, so without it the list reshuffled on every join and leave.
+    pub seq: u64,
 }
 
 /// A live WebSocket connection registered in a room: its outbound sink plus a
 /// one-shot to force-close it (used by kick/ban). The kill sender is taken once.
 pub struct ConnHandle {
-    pub out: UnboundedSender<Message>,
+    pub out: Sender<Message>,
     pub kill: Option<oneshot::Sender<()>>,
 }
 
@@ -170,6 +173,8 @@ pub struct Room {
     pub created_at: Instant,
     /// Live WebSocket connections, keyed by connection id.
     pub connections: HashMap<String, ConnHandle>,
+    /// Next `User::seq` to hand out.
+    next_seq: u64,
 }
 
 impl Room {
@@ -204,6 +209,7 @@ impl Room {
             chat_history: VecDeque::new(),
             created_at: Instant::now(),
             connections: HashMap::new(),
+            next_seq: 0,
         }
     }
 
@@ -224,9 +230,11 @@ impl Room {
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        let users = self
-            .users
-            .values()
+        // Host first, then everyone in order of arrival.
+        let mut ordered: Vec<&User> = self.users.values().collect();
+        ordered.sort_by_key(|u| (!self.is_host(&u.client_id), u.seq));
+        let users = ordered
+            .into_iter()
             .map(|u| UserView {
                 client_id: u.client_id.clone(),
                 nickname: u.nickname.clone(),
@@ -268,7 +276,15 @@ impl Room {
     pub fn broadcast(&self, msg: &ServerMsg) {
         let json = msg.to_json();
         for handle in self.connections.values() {
-            let _ = handle.out.send(Message::Text(json.clone()));
+            // try_send, not send: this fn is sync and must never block a
+            // room-wide broadcast on one slow reader. A full queue means the
+            // client is not draining; drop the frame rather than buffer it.
+            // The protocol re-broadcasts a full snapshot on the next room
+            // event and the client can also request one, so a dropped frame
+            // is recoverable -- an unbounded queue is not.
+            if handle.out.try_send(Message::Text(json.clone())).is_err() {
+                tracing::debug!("dropping frame for a connection that is not draining");
+            }
         }
     }
 
@@ -306,7 +322,7 @@ impl Room {
             && self
                 .users
                 .get(client_id)
-                .map_or(false, |u| u.seat_token == seat_token)
+                .is_some_and(|u| constant_time_eq(&u.seat_token, seat_token))
     }
 
     /// Seat this join. If `requested_id` names an existing seat and `seat_token`
@@ -346,6 +362,8 @@ impl Room {
     }
 
     fn insert_new_user(&mut self, client_id: &str, conn_id: &str, nickname: String) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
         let user = User {
             client_id: client_id.to_string(),
             seat_token: nanoid!(24, &ID_ALPHABET),
@@ -354,6 +372,7 @@ impl Room {
             nickname,
             buffering: false,
             disconnected: false,
+            seq,
         };
         self.users.insert(client_id.to_string(), user);
     }
@@ -397,17 +416,34 @@ impl Room {
     }
 
     pub fn is_host_token(&self, token: &str) -> bool {
-        !token.is_empty() && token == self.host_token
+        !token.is_empty() && constant_time_eq(token, &self.host_token)
     }
 
     pub fn is_host(&self, client_id: &str) -> bool {
         self.host_client_id.as_deref() == Some(client_id)
     }
 
-    /// Pick a live, connected user to inherit host. Returns the new host's
+    /// Hand host to another connected seat, returning its nickname (`None` if
+    /// there is no such seat, or it is away). Rotates the host token: the
+    /// creator's copy of it grants host on every join, so otherwise the old
+    /// host would take the room back on their next reconnect.
+    pub fn transfer_host(&mut self, target: &str) -> Option<String> {
+        let nick = self
+            .users
+            .get(target)
+            .filter(|u| !u.disconnected)?
+            .nickname
+            .clone();
+        self.host_client_id = Some(target.to_string());
+        self.host_token = nanoid!(32, &ID_ALPHABET);
+        Some(nick)
+    }
+
+    /// Pick a live, connected user to inherit host — the longest-present one,
+    /// rather than whichever the HashMap yields first. Returns the new host's
     /// nickname, if any.
     pub fn migrate_host(&mut self) -> Option<String> {
-        if let Some(u) = self.users.values().find(|u| !u.disconnected) {
+        if let Some(u) = self.users.values().filter(|u| !u.disconnected).min_by_key(|u| u.seq) {
             let cid = u.client_id.clone();
             let nick = u.nickname.clone();
             self.host_client_id = Some(cid);
@@ -417,6 +453,11 @@ impl Room {
         None
     }
 
+    /// Move the playhead and/or play-pause state. `paused: None` keeps both the
+    /// pause state and any auto-pause: only a deliberate play or pause overrides
+    /// a wait for buffering viewers. A seek used to clear `auto_paused` too, so a
+    /// scrub while the room waited turned the wait into a pause nobody had asked
+    /// for — the room stayed stopped after everyone caught up.
     pub fn update_video_state(&mut self, paused: Option<bool>, current_time: Option<f64>) {
         let live = self.compute_live_time();
         let v = &mut self.video;
@@ -426,9 +467,9 @@ impl Room {
         }
         if let Some(p) = paused {
             v.paused = p;
+            v.auto_paused = false;
         }
         v.last_update = Instant::now();
-        v.auto_paused = false;
     }
 
     pub fn set_rate(&mut self, rate: f64, allowed: &[f64]) -> bool {
@@ -456,10 +497,24 @@ impl Room {
         // The caller re-arms a fresh proxy generation for non-YouTube media; a
         // YouTube change just leaves this cleared.
         self.video.stream = None;
+        self.clear_buffering();
     }
 
     pub fn clear_media(&mut self) {
         self.video = VideoState::default();
+        self.clear_buffering();
+    }
+
+    /// Buffering describes one viewer's progress through one piece of media, so
+    /// a media change voids it. Clients tear their player down on a change and
+    /// start over not-buffering; a flag left set here outlived that and, since
+    /// `set_buffering` only acts on transitions, kept `any_buffering` true for
+    /// good — the next time anyone else buffered, the room auto-paused and then
+    /// never auto-resumed.
+    fn clear_buffering(&mut self) {
+        for user in self.users.values_mut() {
+            user.buffering = false;
+        }
     }
 
     /// Begin (or restart, on a seek) the proxy stream for the current media:
@@ -663,6 +718,7 @@ impl AppState {
             config.hls_segment_sec,
             config.stream_audio_bitrate.clone(),
             config.stream_ready_timeout_sec,
+            config.stream_max_bytes,
         );
         let room_limiter =
             IpRateLimiter::new(config.http_room_bucket.capacity, config.http_room_bucket.refill_per_sec);
@@ -691,8 +747,9 @@ impl AppState {
     }
 
     /// Create a fresh room, evicting the oldest empty room first if at capacity.
-    /// Returns `(room_id, host_token)`.
-    pub async fn create_room(&self) -> (String, String) {
+    /// Returns `(room_id, host_token)`, or `None` when the server is full and
+    /// nothing could be evicted.
+    pub async fn create_room(&self) -> Option<(String, String)> {
         // A generated id must not shadow a registered slug (10 chars from a
         // 31-symbol alphabet makes a collision ~impossible, but the indexed
         // lookup is free). Checked before the lock; ids never leave this fn
@@ -704,10 +761,20 @@ impl AppState {
                 _ => break room,
             }
         };
-        let evicted = {
+        let outcome = {
             let mut rooms = self.rooms.write().await;
             let evicted = if rooms.len() >= self.config.max_rooms {
-                evict_oldest_empty(&mut rooms)
+                // MAX_ROOMS was previously advisory: the insert below ran even
+                // when eviction found nothing, so `rooms` grew without bound.
+                // Every room is empty-reaped eventually, but a `persistent`
+                // room is exempt from BOTH reaping and eviction -- and the
+                // first joiner is always host and can set persistent -- so a
+                // single client could pin arbitrarily many rooms in memory.
+                match evict_oldest_empty(&mut rooms) {
+                    Some(victim) => Some(victim),
+                    // Genuinely full: every room is occupied or persistent.
+                    None => return None,
+                }
             } else {
                 None
             };
@@ -718,12 +785,12 @@ impl AppState {
             // after the lock is dropped.
             (id, token, evicted)
         };
-        let (id, token, evicted) = evicted;
+        let (id, token, evicted) = outcome;
         // Tear down the evicted room's ffmpeg + RAM-disk dir (lock released).
         if let Some(victim) = evicted {
             self.streams.stop(&victim).await;
         }
-        (id, token)
+        Some((id, token))
     }
 
     pub fn join_config(&self) -> JoinConfig {
@@ -733,6 +800,25 @@ impl AppState {
             drift_tolerance_sec: self.config.drift_tolerance_sec,
         }
     }
+}
+
+/// Byte-wise comparison that does not short-circuit on the first difference.
+///
+/// These are the bearer secrets for host privileges and seat takeover, and the
+/// WebSocket path lets a client submit guesses at high rate. At 158 and 119
+/// bits they were not practically attackable through `==`, but every other
+/// secret comparison in the codebase goes through a hash, and a timing-safe
+/// compare is the cheap way to keep that property as the tokens change.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Evict the oldest empty, non-persistent room. Returns its id so the caller can
@@ -747,4 +833,147 @@ fn evict_oldest_empty(rooms: &mut HashMap<String, Room>) -> Option<String> {
         rooms.remove(id);
     }
     victim
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn media(src: &str) -> Media {
+        Media {
+            kind: "file".into(),
+            id: None,
+            source: src.into(),
+            start: 0.0,
+            title: src.into(),
+            is_live: false,
+        }
+    }
+
+    fn room_with(users: &[&str]) -> Room {
+        let mut room = Room::new();
+        for (i, id) in users.iter().enumerate() {
+            room.claim_seat(id, "", &format!("conn-{i}"), id.to_string());
+        }
+        room.set_media(media("https://example.com/a.mp4"));
+        room
+    }
+
+    #[test]
+    fn room_waits_for_every_buffering_viewer() {
+        let mut room = room_with(&["alice-01", "bob-0001"]);
+        assert!(!room.video.paused);
+
+        room.set_buffering("alice-01", true);
+        assert!(room.video.paused && room.video.auto_paused);
+        room.set_buffering("bob-0001", true);
+        room.set_buffering("alice-01", false);
+        assert!(room.video.paused, "bob is still buffering");
+        room.set_buffering("bob-0001", false);
+        assert!(!room.video.paused && !room.video.auto_paused);
+    }
+
+    #[test]
+    fn repeated_reports_are_not_transitions() {
+        let mut room = room_with(&["alice-01"]);
+        assert!(matches!(room.set_buffering("alice-01", false), BufferOutcome::Unchanged));
+        assert!(matches!(room.set_buffering("alice-01", true), BufferOutcome::Changed));
+        assert!(matches!(room.set_buffering("alice-01", true), BufferOutcome::Unchanged));
+        assert!(matches!(room.set_buffering("nobody-1", true), BufferOutcome::Unchanged));
+    }
+
+    /// Regression: a flag set under the previous media used to survive the
+    /// change, so the next viewer to buffer paused the room for good.
+    #[test]
+    fn media_change_voids_buffering_flags() {
+        let mut room = room_with(&["alice-01", "bob-0001"]);
+        room.set_buffering("alice-01", true);
+        room.set_media(media("https://example.com/b.mp4"));
+        assert!(room.users.values().all(|u| !u.buffering));
+        assert!(!room.video.paused);
+
+        room.set_buffering("bob-0001", true);
+        assert!(room.video.paused);
+        room.set_buffering("bob-0001", false);
+        assert!(!room.video.paused, "the room must resume once bob is ready");
+    }
+
+    #[test]
+    fn clearing_media_voids_buffering_flags() {
+        let mut room = room_with(&["alice-01"]);
+        room.set_buffering("alice-01", true);
+        room.clear_media();
+        assert!(!room.users["alice-01"].buffering);
+    }
+
+    /// A deliberate play during an auto-pause wins; the buffering viewer
+    /// catching up afterwards must not toggle anything.
+    #[test]
+    fn manual_play_overrides_auto_pause() {
+        let mut room = room_with(&["alice-01", "bob-0001"]);
+        room.set_buffering("alice-01", true);
+        room.update_video_state(Some(false), None);
+        assert!(!room.video.paused && !room.video.auto_paused);
+        room.set_buffering("alice-01", false);
+        assert!(!room.video.paused);
+    }
+
+    #[test]
+    fn users_are_listed_host_first_then_by_arrival() {
+        let mut room = room_with(&["carol-01", "alice-01", "bob-0001", "dave-001"]);
+        room.set_host("bob-0001");
+        let order: Vec<String> = room.snapshot().users.into_iter().map(|u| u.client_id).collect();
+        assert_eq!(order, ["bob-0001", "carol-01", "alice-01", "dave-001"]);
+    }
+
+    #[test]
+    fn host_migrates_to_the_longest_present_user() {
+        let mut room = room_with(&["carol-01", "alice-01", "bob-0001"]);
+        room.set_host("carol-01");
+        room.remove_user("carol-01");
+        assert_eq!(room.migrate_host().as_deref(), Some("alice-01"));
+        assert!(room.is_host("alice-01"));
+    }
+
+    #[test]
+    fn transfer_host_rotates_the_host_token() {
+        let mut room = room_with(&["alice-01", "bob-0001"]);
+        room.set_host("alice-01");
+        let old_token = room.host_token.clone();
+        assert_eq!(room.transfer_host("bob-0001").as_deref(), Some("bob-0001"));
+        assert!(room.is_host("bob-0001"));
+        assert!(!room.is_host_token(&old_token), "the old host's token must stop working");
+    }
+
+    #[test]
+    fn transfer_host_refuses_missing_or_away_users() {
+        let mut room = room_with(&["alice-01", "bob-0001"]);
+        room.set_host("alice-01");
+        room.mark_disconnected("bob-0001");
+        assert_eq!(room.transfer_host("bob-0001"), None);
+        assert_eq!(room.transfer_host("nobody-1"), None);
+        assert!(room.is_host("alice-01"));
+    }
+
+    /// Regression: a seek during an auto-pause cleared `auto_paused`, so the
+    /// room never resumed once the buffering viewer caught up.
+    #[test]
+    fn a_seek_while_waiting_keeps_the_room_waiting() {
+        let mut room = room_with(&["alice-01", "bob-0001"]);
+        room.set_buffering("bob-0001", true);
+        room.update_video_state(None, Some(180.0));
+        assert!(room.video.paused && room.video.auto_paused);
+        assert_eq!(room.video.current_time, 180.0);
+        room.set_buffering("bob-0001", false);
+        assert!(!room.video.paused, "the room resumes once bob is ready");
+    }
+
+    #[test]
+    fn leaving_while_buffering_releases_the_room() {
+        let mut room = room_with(&["alice-01", "bob-0001"]);
+        room.set_buffering("alice-01", true);
+        room.mark_disconnected("alice-01");
+        assert!(room.reconcile_auto_pause());
+        assert!(!room.video.paused);
+    }
 }

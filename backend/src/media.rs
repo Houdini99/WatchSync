@@ -39,8 +39,8 @@ impl TitleCache {
     }
 
     pub fn put(&mut self, id: String, title: String) {
-        if self.map.contains_key(&id) {
-            self.map.insert(id, title);
+        if let Some(existing) = self.map.get_mut(&id) {
+            *existing = title;
             return;
         }
         if self.order.len() >= TITLE_CACHE_MAX {
@@ -127,7 +127,11 @@ fn extract_start_seconds(url: &Url) -> f64 {
         .find(|(k, _)| k == "t" || k == "start")
         .map(|(_, v)| v.into_owned());
     let Some(raw) = raw else { return 0.0 };
+    parse_start_param(&raw)
+}
 
+/// The value half of `?t=` / `?start=`, split out so it is directly testable.
+fn parse_start_param(raw: &str) -> f64 {
     if let Ok(n) = raw.parse::<u64>() {
         return n.min(86400) as f64;
     }
@@ -139,12 +143,16 @@ fn extract_start_seconds(url: &Url) -> f64 {
         if c.is_ascii_digit() {
             num.push(c);
         } else {
+            // Saturating throughout: `?t=99999999999999999h` overflows u64.
+            // The release profile sets no overflow-checks so that wrapped
+            // silently, but a debug/test build panicked inside the WebSocket
+            // handler task (detect_media runs from on_change_video/on_queue_add).
             let val: u64 = num.parse().unwrap_or(0);
             num.clear();
             match c.to_ascii_lowercase() {
-                'h' => secs += val * 3600,
-                'm' => secs += val * 60,
-                's' => secs += val,
+                'h' => secs = secs.saturating_add(val.saturating_mul(3600)),
+                'm' => secs = secs.saturating_add(val.saturating_mul(60)),
+                's' => secs = secs.saturating_add(val),
                 _ => {}
             }
         }
@@ -180,7 +188,7 @@ fn extract_youtube_id(url: &Url) -> Option<String> {
 fn pretty_title(url: &Url) -> String {
     let base = url
         .path_segments()
-        .and_then(|segs| segs.filter(|s| !s.is_empty()).last())
+        .and_then(|mut segs| segs.rfind(|s| !s.is_empty()))
         .map(|s| s.to_string())
         .unwrap_or_else(|| url.host_str().unwrap_or("video").to_string());
     percent_decode(&base)
@@ -234,30 +242,59 @@ fn ip_is_public(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => ipv4_is_public(v4),
         std::net::IpAddr::V6(v6) => {
-            // An IPv4 tucked inside IPv6 must pass the IPv4 rules.
-            if let Some(v4) = v6.to_ipv4() {
+            let segs = v6.segments();
+            // Reject all of ::/96 — the deprecated "IPv4-compatible" block —
+            // before any v4 unwrapping, and reject it wholesale rather than
+            // just its named members. It contains `::1` (loopback) and `::`
+            // (unspecified), and `to_ipv4()` turns `::1` into `0.0.0.1`, which
+            // passes every IPv4 rule below. That was a live bypass: a hostname
+            // with an AAAA record of ::1 reached ffmpeg.
+            if segs[..6].iter().all(|&s| s == 0) {
+                return false;
+            }
+            // Only IPv4-*mapped* (::ffff:0:0/96, i.e. segs[5] == 0xffff)
+            // denotes a real IPv4 target, so it alone follows the IPv4 rules.
+            if let Some(v4) = v6.to_ipv4_mapped() {
                 return ipv4_is_public(v4);
             }
-            let seg0 = v6.segments()[0];
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (seg0 & 0xfe00) == 0xfc00   // unique local fc00::/7
-                || (seg0 & 0xffc0) == 0xfe80)  // link local fe80::/10
+            // Each range is matched at its real prefix length. Matching on
+            // segs[0] alone would be far too broad here: 2001::/16 holds a
+            // great deal of ordinary public space (Google's public DNS at
+            // 2001:4860::, HE tunnels at 2001:470::, …), and only 2001::/23
+            // and 2001:db8::/32 inside it are actually reserved.
+            let seg0 = segs[0];
+            !(v6.is_multicast()
+                || (seg0 & 0xfe00) == 0xfc00                    // unique local fc00::/7
+                || (seg0 & 0xffc0) == 0xfe80                    // link local fe80::/10
+                || (seg0 == 0x0064 && segs[1] == 0xff9b)        // NAT64 64:ff9b::/32
+                || (seg0 == 0x0100 && segs[1] == 0
+                    && segs[2] == 0 && segs[3] == 0)            // discard-only 100::/64
+                || (seg0 == 0x2001 && (segs[1] & 0xfe00) == 0)  // IETF protocol 2001::/23
+                || (seg0 == 0x2001 && segs[1] == 0x0db8))       // documentation 2001:db8::/32
         }
     }
 }
 
 fn ipv4_is_public(v4: std::net::Ipv4Addr) -> bool {
     let o = v4.octets();
+    // Kept deliberately in step with the resolver's Python guard
+    // (resolver/app.py:_ip_is_internal), which leans on ipaddress's
+    // is_private/is_reserved. Divergence between the two is how one of them
+    // silently becomes the weak link — see the tests below.
     !(v4.is_loopback()
         || v4.is_unspecified()
         || v4.is_private()
         || v4.is_link_local()
         || v4.is_broadcast()
         || v4.is_multicast()
-        || (o[0] == 100 && (o[1] & 0xc0) == 64) // CGNAT 100.64.0.0/10
-        || o[0] >= 240) // reserved 240.0.0.0/4
+        || o[0] == 0                                        // "this network" 0.0.0.0/8
+        || (o[0] == 100 && (o[1] & 0xc0) == 64)             // CGNAT 100.64.0.0/10
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)          // IETF protocol 192.0.0.0/24
+        || (o[0] == 192 && o[1] == 0 && o[2] == 2)          // TEST-NET-1 192.0.2.0/24
+        || (o[0] == 198 && (o[1] & 0xfe) == 18)             // benchmarking 198.18.0.0/15
+        || (o[0] == 198 && o[1] == 51 && o[2] == 100)       // TEST-NET-2 198.51.100.0/24
+        || (o[0] == 203 && o[1] == 0 && o[2] == 113)        // TEST-NET-3 203.0.113.0/24
+        || o[0] >= 240) // reserved 240.0.0.0/4 (incl. 255.255.255.255)
 }
 
 /// Fetch a YouTube title via the public oEmbed endpoint. Returns `None` on any
@@ -298,4 +335,107 @@ fn urlencoding_encode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn v6(s: &str) -> IpAddr {
+        IpAddr::V6(s.parse::<Ipv6Addr>().unwrap())
+    }
+    fn v4(s: &str) -> IpAddr {
+        IpAddr::V4(s.parse::<Ipv4Addr>().unwrap())
+    }
+
+    /// Regression: `Ipv6Addr::to_ipv4()` converts IPv4-*compatible* ::/96 too,
+    /// so `::1` became `0.0.0.1` and passed every IPv4 rule. A hostname with an
+    /// AAAA record of ::1 reached ffmpeg.
+    #[test]
+    fn ipv6_compatible_range_is_not_unwrapped_to_public_ipv4() {
+        assert!(!ip_is_public(v6("::1")), "::1 (loopback) must be rejected");
+        assert!(!ip_is_public(v6("::")), ":: (unspecified) must be rejected");
+        assert!(!ip_is_public(v6("::2")), "::/96 must not unwrap to public IPv4");
+        assert!(!ip_is_public(v6("::0.0.0.2")), "::/96 written as v4 must be rejected");
+    }
+
+    #[test]
+    fn ipv4_mapped_v6_follows_ipv4_rules() {
+        assert!(!ip_is_public(v6("::ffff:127.0.0.1")));
+        assert!(!ip_is_public(v6("::ffff:10.0.0.5")));
+        assert!(!ip_is_public(v6("::ffff:169.254.169.254")));
+        assert!(ip_is_public(v6("::ffff:8.8.8.8")));
+    }
+
+    #[test]
+    fn ipv6_internal_ranges_rejected() {
+        for addr in ["fe80::1", "fc00::1", "fd12:3456::1", "ff02::1", "64:ff9b::1"] {
+            assert!(!ip_is_public(v6(addr)), "{addr} must be rejected");
+        }
+    }
+
+    /// Guards against over-blocking: 2001::/16 is mostly ordinary public space,
+    /// and only 2001::/23 and 2001:db8::/32 inside it are reserved. Matching
+    /// the whole /16 would blackhole Google public DNS, HE tunnels and more.
+    #[test]
+    fn ipv6_public_allowed() {
+        for addr in [
+            "2606:4700:4700::1111",      // Cloudflare
+            "2a00:1450:4001:80f::200e",  // Google
+            "2001:4860:4860::8888",      // Google public DNS — inside 2001::/16
+            "2001:470:1f0b::1",          // Hurricane Electric — inside 2001::/16
+        ] {
+            assert!(ip_is_public(v6(addr)), "{addr} must be allowed");
+        }
+    }
+
+    #[test]
+    fn ipv6_reserved_subranges_of_2001_rejected() {
+        assert!(!ip_is_public(v6("2001::1")), "Teredo 2001::/32");
+        assert!(!ip_is_public(v6("2001:1ff::1")), "IETF protocol 2001::/23 upper edge");
+        assert!(!ip_is_public(v6("2001:db8::1")), "documentation 2001:db8::/32");
+        assert!(!ip_is_public(v6("64:ff9b::1")), "NAT64");
+        assert!(!ip_is_public(v6("100::1")), "discard-only");
+    }
+
+    /// These ranges are what the resolver's Python guard already covered via
+    /// `is_reserved`/`is_private`; the Rust side used to miss them.
+    #[test]
+    fn ipv4_internal_and_reserved_ranges_rejected() {
+        for addr in [
+            "127.0.0.1", "0.0.0.0", "0.1.2.3", "10.0.0.5", "172.16.0.1",
+            "192.168.1.1", "169.254.169.254", "100.64.0.1", "192.0.0.1",
+            "192.0.2.1", "198.18.0.1", "198.19.255.254", "198.51.100.1",
+            "203.0.113.1", "224.0.0.1", "240.0.0.1", "255.255.255.255",
+        ] {
+            assert!(!ip_is_public(v4(addr)), "{addr} must be rejected");
+        }
+    }
+
+    #[test]
+    fn ipv4_public_allowed() {
+        for addr in ["8.8.8.8", "1.1.1.1", "142.250.185.78", "99.99.99.99"] {
+            assert!(ip_is_public(v4(addr)), "{addr} must be allowed");
+        }
+    }
+
+    #[test]
+    fn timestamp_parsing_saturates_instead_of_overflowing() {
+        // Panicked in debug builds before this; the cap is 86400 either way.
+        assert_eq!(parse_start_param("99999999999999999h"), 86400.0);
+        assert_eq!(parse_start_param("18446744073709551615s"), 86400.0);
+        assert_eq!(parse_start_param("1h2m3s"), 3723.0);
+        assert_eq!(parse_start_param("90"), 90.0);
+        assert_eq!(parse_start_param(""), 0.0);
+    }
+
+    /// 100.64.0.0/10 is CGNAT; 100.0.0.0/8 outside it is ordinary public space.
+    #[test]
+    fn cgnat_boundaries() {
+        assert!(!ip_is_public(v4("100.64.0.0")));
+        assert!(!ip_is_public(v4("100.127.255.255")));
+        assert!(ip_is_public(v4("100.63.255.255")));
+        assert!(ip_is_public(v4("100.128.0.0")));
+    }
 }

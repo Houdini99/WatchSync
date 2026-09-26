@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { client } from '../client';
+import { PRIVACY_PATH, navigate } from '../lib/nav';
 import { useStore } from '../store';
 
 export default function NicknameModal() {
@@ -31,12 +32,20 @@ export default function NicknameModal() {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div className="w-full max-w-sm rounded-[10px] border border-border bg-surface p-8 shadow-panel">
-        <h2 className="mb-5 text-xl font-semibold">Pick a nickname</h2>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="nickname-modal-title"
+        className="w-full max-w-sm rounded-[10px] border border-border bg-surface p-8 shadow-panel"
+      >
+        <h2 id="nickname-modal-title" className="mb-5 text-xl font-semibold">
+          Pick a nickname
+        </h2>
         <input
           ref={inputRef}
           value={value}
           maxLength={24}
+          aria-label="Nickname"
           placeholder="Your name"
           autoComplete="off"
           onChange={(e) => setValue(e.target.value)}
@@ -49,6 +58,19 @@ export default function NicknameModal() {
         >
           Join Room
         </button>
+        <p className="mt-4 text-center text-xs text-dim">
+          Your nickname and chat are shared with everyone in the room.{' '}
+          <a
+            href={PRIVACY_PATH}
+            onClick={(e) => {
+              e.preventDefault();
+              navigate(PRIVACY_PATH);
+            }}
+            className="text-accent underline-offset-2 hover:underline"
+          >
+            Datenschutz / Privacy
+          </a>
+        </p>
       </div>
     </div>
   );

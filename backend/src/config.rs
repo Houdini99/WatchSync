@@ -3,6 +3,7 @@
 //! instance without a rebuild. Nothing else should hardcode these numbers.
 
 use std::env;
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
@@ -24,8 +25,13 @@ pub struct Config {
     pub port: u16,
     pub host: String,
     pub cors_origin: CorsOrigin,
-    /// Base URL of the optional yt-dlp resolver sidecar. `None` → `/api/resolve`
-    /// stays a 501 stub.
+    /// Peers whose `X-Real-IP` / `X-Forwarded-For` headers may be believed.
+    /// Anything else is rate-limited by its actual socket address.
+    pub trusted_proxies: TrustedProxies,
+    /// Base URL of the optional yt-dlp resolver sidecar, used server-side by
+    /// `stream::prepare_source` and the `/api/subtitles*` routes. `None` →
+    /// non-direct media falls back to handing the page URL straight to ffmpeg
+    /// (usually a failure) and subtitle listing returns 501.
     pub resolver_url: Option<String>,
     /// Permit media URLs that resolve to private/loopback/link-local addresses.
     /// Off by default: user-pasted URLs are fetched server-side (ffmpeg/yt-dlp),
@@ -55,6 +61,10 @@ pub struct Config {
     pub streams_dir: PathBuf,
     /// `-hls_time`: target segment length in seconds.
     pub hls_segment_sec: u32,
+    /// `-fs`: hard byte ceiling on ONE room's ffmpeg output. The RAM disk is
+    /// shared by every room, so without a per-room budget a single long video
+    /// fills it and every other room's ffmpeg dies with ENOSPC.
+    pub stream_max_bytes: u64,
     /// `-b:a` for the transcoded AAC audio track.
     pub stream_audio_bitrate: String,
     /// How long to wait for ffmpeg to produce a playable playlist before
@@ -106,6 +116,9 @@ impl Config {
             port: env::var("PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(3000),
             host: env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
             cors_origin: parse_origin(env::var("CORS_ORIGIN").ok().as_deref()),
+            trusted_proxies: TrustedProxies::parse(
+                env::var("TRUSTED_PROXIES").ok().as_deref(),
+            ),
             resolver_url: env::var("RESOLVER_URL")
                 .ok()
                 .map(|s| s.trim().trim_end_matches('/').to_string())
@@ -128,6 +141,9 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/dev/shm/streams")),
             hls_segment_sec: uint("HLS_SEGMENT_SEC", 4) as u32,
+            // 1 GiB: roughly a 2h 1080p H.264 remux, and half the default 2g
+            // tmpfs, so one room cannot starve the rest on its own.
+            stream_max_bytes: uint("STREAM_MAX_BYTES", 1024 * 1024 * 1024),
             stream_audio_bitrate: env::var("STREAM_AUDIO_BITRATE")
                 .ok()
                 .map(|s| s.trim().to_string())
@@ -254,5 +270,170 @@ fn parse_rates(raw: Option<&str>) -> Option<Vec<f64>> {
         None
     } else {
         Some(rates)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trusted proxies
+// ---------------------------------------------------------------------------
+
+/// The set of peers allowed to tell us who the real client is.
+///
+/// `client_ip` keys every per-IP rate limit, so believing a forwarding header
+/// from an arbitrary peer means the limits are opt-out: any caller can send
+/// `X-Real-IP: <random>` per request and never hit a bucket. Believing NO peer
+/// is equally wrong behind the bundled Nginx, where the socket address is
+/// always the proxy container. So: believe the header only from a listed peer.
+#[derive(Clone, Debug)]
+pub struct TrustedProxies(Vec<(IpAddr, u8)>);
+
+/// Private/loopback space. The default because in every supported topology the
+/// hop in front of the server is a container on a Docker network; a public
+/// source address is by definition not our reverse proxy.
+const DEFAULT_TRUSTED_PROXIES: &str =
+    "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7";
+
+impl TrustedProxies {
+    /// Comma-separated CIDRs or bare IPs. Unset uses the private-range default;
+    /// an explicit empty string trusts nothing (every client keyed by its real
+    /// socket address, correct when the server is exposed directly).
+    pub fn parse(raw: Option<&str>) -> Self {
+        let spec = match raw {
+            None => DEFAULT_TRUSTED_PROXIES,
+            Some(s) if s.trim().is_empty() => return TrustedProxies(Vec::new()),
+            Some(s) => s,
+        };
+        let nets = spec
+            .split(',')
+            .filter_map(|entry| parse_cidr(entry.trim()))
+            .collect();
+        TrustedProxies(nets)
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        // An IPv4-mapped peer (::ffff:10.0.0.1) must match IPv4 rules.
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+            v4 => v4,
+        };
+        self.0.iter().any(|&(net, prefix)| ip_in_net(ip, net, prefix))
+    }
+}
+
+/// `"10.0.0.0/8"` or `"10.1.2.3"` (treated as a full-length prefix).
+fn parse_cidr(entry: &str) -> Option<(IpAddr, u8)> {
+    if entry.is_empty() {
+        return None;
+    }
+    let (addr_part, prefix_part) = match entry.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (entry, None),
+    };
+    let addr: IpAddr = addr_part.parse().ok()?;
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    let prefix = match prefix_part {
+        None => max,
+        Some(p) => {
+            let n: u8 = p.parse().ok()?;
+            if n > max {
+                return None;
+            }
+            n
+        }
+    };
+    Some((addr, prefix))
+}
+
+/// `true` when `ip` falls inside `net/prefix`. Mismatched families never match.
+fn ip_in_net(ip: IpAddr, net: IpAddr, prefix: u8) -> bool {
+    fn masked_eq(a: &[u8], b: &[u8], prefix: u8) -> bool {
+        let full = (prefix / 8) as usize;
+        let rem = prefix % 8;
+        if a[..full] != b[..full] {
+            return false;
+        }
+        if rem == 0 {
+            return true;
+        }
+        let mask = 0xffu8 << (8 - rem);
+        (a[full] & mask) == (b[full] & mask)
+    }
+    match (ip, net) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => masked_eq(&a.octets(), &b.octets(), prefix),
+        (IpAddr::V6(a), IpAddr::V6(b)) => masked_eq(&a.octets(), &b.octets(), prefix),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn default_trusts_private_space_only() {
+        let t = TrustedProxies::parse(None);
+        for addr in ["127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255",
+                     "192.168.1.1", "::1", "fd00::1"] {
+            assert!(t.contains(ip(addr)), "{addr} should be trusted by default");
+        }
+        for addr in ["8.8.8.8", "1.1.1.1", "172.32.0.1", "172.15.255.255",
+                     "193.168.1.1", "2606:4700::1111"] {
+            assert!(!t.contains(ip(addr)), "{addr} must NOT be trusted");
+        }
+    }
+
+    /// An explicit empty value means "trust nothing" -- correct when the server
+    /// is exposed directly rather than behind the bundled nginx.
+    #[test]
+    fn explicit_empty_trusts_nothing() {
+        let t = TrustedProxies::parse(Some(""));
+        assert!(!t.contains(ip("127.0.0.1")));
+        assert!(!t.contains(ip("10.0.0.1")));
+    }
+
+    #[test]
+    fn parses_explicit_list_and_bare_ips() {
+        let t = TrustedProxies::parse(Some("203.0.113.7, 198.51.100.0/24"));
+        assert!(t.contains(ip("203.0.113.7")));
+        assert!(!t.contains(ip("203.0.113.8")), "bare IP is a /32");
+        assert!(t.contains(ip("198.51.100.1")));
+        assert!(t.contains(ip("198.51.100.255")));
+        assert!(!t.contains(ip("198.51.101.0")));
+        assert!(!t.contains(ip("10.0.0.1")), "default is replaced, not extended");
+    }
+
+    /// Docker frequently presents peers as ::ffff:a.b.c.d on a dual-stack
+    /// listener; those must match the IPv4 rules or nginx stops being trusted.
+    #[test]
+    fn ipv4_mapped_peer_matches_ipv4_rule() {
+        let t = TrustedProxies::parse(Some("172.16.0.0/12"));
+        assert!(t.contains(ip("::ffff:172.16.0.5")));
+        assert!(!t.contains(ip("::ffff:8.8.8.8")));
+    }
+
+    #[test]
+    fn non_byte_aligned_prefixes() {
+        let t = TrustedProxies::parse(Some("10.0.0.0/12"));
+        assert!(t.contains(ip("10.0.0.1")));
+        assert!(t.contains(ip("10.15.255.255")));
+        assert!(!t.contains(ip("10.16.0.0")));
+    }
+
+    #[test]
+    fn malformed_entries_are_skipped_not_fatal() {
+        let t = TrustedProxies::parse(Some("not-an-ip,10.0.0.0/8,10.0.0.0/99,"));
+        assert!(t.contains(ip("10.1.1.1")));
+        assert!(!t.contains(ip("8.8.8.8")));
+    }
+
+    #[test]
+    fn families_do_not_cross_match() {
+        let t = TrustedProxies::parse(Some("0.0.0.0/0"));
+        assert!(t.contains(ip("8.8.8.8")));
+        assert!(!t.contains(ip("2606:4700::1111")), "v4 rule must not match v6");
     }
 }

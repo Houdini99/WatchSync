@@ -35,7 +35,9 @@ export default function UsersPanel() {
                 {u.is_host && (
                   <span className="rounded-full bg-accent px-1.5 py-px text-[0.7rem] font-semibold text-white">HOST</span>
                 )}
-                {canModerate && <ModerationMenu clientId={u.client_id} nickname={u.nickname} />}
+                {canModerate && (
+                  <ModerationMenu clientId={u.client_id} nickname={u.nickname} away={u.disconnected} />
+                )}
               </span>
             </li>
           );
@@ -45,8 +47,12 @@ export default function UsersPanel() {
   );
 }
 
-/** Host-only kick/ban controls for a single user. */
-function ModerationMenu({ clientId, nickname }: { clientId: string; nickname: string }) {
+/** Host-only controls for a single user: hand over host, kick, ban. */
+function ModerationMenu({ clientId, nickname, away }: { clientId: string; nickname: string; away: boolean }) {
+  function makeHost() {
+    if (!window.confirm(`Make ${nickname} the host? You'll lose host controls.`)) return;
+    if (client.transferHost(clientId)) useStore.getState().showToast(`${nickname} is now the host`);
+  }
   function kick() {
     client.kickUser(clientId);
     useStore.getState().showToast(`Removed ${nickname}`);
@@ -60,6 +66,15 @@ function ModerationMenu({ clientId, nickname }: { clientId: string; nickname: st
     'rounded border border-border bg-transparent px-1.5 py-px text-[0.7rem] text-dim transition hover:border-danger hover:text-danger';
   return (
     <span className="flex items-center gap-1">
+      {!away && (
+        <button
+          className={`${btn} hover:!border-accent hover:!text-accent`}
+          title={`Make ${nickname} the host`}
+          onClick={makeHost}
+        >
+          Host
+        </button>
+      )}
       <button className={btn} title={`Remove ${nickname}`} onClick={kick}>
         Kick
       </button>

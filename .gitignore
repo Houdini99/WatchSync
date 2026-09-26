@@ -15,12 +15,29 @@ __pycache__/
 
 # Env / local
 .env
+.env.*
+!.env.example
 *.local
+
+# Databases — DATABASE_PATH is configurable, so the /backend/data rule above
+# only covers the default location.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+npm-debug.log*
 
 # Local planning notes — not part of the shipped project
 /Plan.md
+/next_session.md
 
 # Editor / OS / tooling
+.playwright-mcp/
 .DS_Store
 .vscode
 .idea

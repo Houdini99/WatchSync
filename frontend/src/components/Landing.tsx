@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { client } from '../client';
 import { api } from '../lib/api';
+import { PRIVACY_PATH, navigate } from '../lib/nav';
 import { useStore } from '../store';
 import MyRooms from './MyRooms';
 
@@ -92,8 +93,23 @@ export default function Landing() {
           </p>
         )}
       </div>
-      <footer className="absolute bottom-4 left-0 right-0 text-center font-mono text-xs text-dim">
-        {version}
+      <footer className="absolute bottom-4 left-0 right-0 flex items-center justify-center gap-3 text-center text-xs text-dim">
+        {version && (
+          <>
+            <span className="font-mono">{version}</span>
+            <span aria-hidden>·</span>
+          </>
+        )}
+        <a
+          href={PRIVACY_PATH}
+          onClick={(e) => {
+            e.preventDefault();
+            navigate(PRIVACY_PATH);
+          }}
+          className="underline-offset-2 transition hover:text-text hover:underline"
+        >
+          Datenschutz / Privacy
+        </a>
       </footer>
     </div>
   );

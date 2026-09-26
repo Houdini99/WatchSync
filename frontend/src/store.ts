@@ -4,7 +4,7 @@
 import { create } from 'zustand';
 import type { Account, ChatItem, FloatingReaction, Media, StreamView, SubtitleTrack, UserView } from './types';
 
-export type View = 'landing' | 'nickname' | 'room';
+export type View = 'landing' | 'nickname' | 'room' | 'privacy';
 export type Tab = 'chat' | 'queue' | 'users';
 export type Theme = 'dark' | 'light';
 export type PingClass = 'good' | 'warn' | 'bad' | '';
@@ -104,6 +104,8 @@ interface StoreState {
 
 let toastTimer: number | null = null;
 
+const MAX_REACTIONS = 40;
+
 const initialRate = 1;
 
 export const useStore = create<StoreState>((set) => ({
@@ -168,7 +170,12 @@ export const useStore = create<StoreState>((set) => ({
     }),
   incUnread: () => set((s) => ({ unread: s.unread + 1 })),
   clearUnread: () => set({ unread: 0 }),
-  addReaction: (r) => set((s) => ({ reactions: [...s.reactions, r] })),
+  // Capped. Removal happens only on the CSS animationend in VideoPlayer, and
+  // CSS animations are throttled or paused in a background tab (and the layer
+  // is not mounted at all outside the room view), so that event may never
+  // fire. Someone spamming the reaction bar while a viewer sits in another tab
+  // grew this without limit — plus one DOM node each once they returned.
+  addReaction: (r) => set((s) => ({ reactions: [...s.reactions, r].slice(-MAX_REACTIONS) })),
   removeReaction: (id) => set((s) => ({ reactions: s.reactions.filter((r) => r.id !== id) })),
 
   setCaptionTracks: (captionTracks) => set({ captionTracks }),

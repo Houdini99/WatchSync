@@ -12,6 +12,7 @@ function thumbnailUrl(item: Media): string | null {
 
 export default function QueuePanel() {
   const queue = useStore((s) => s.queue);
+  const hasMedia = useStore((s) => !!s.media);
   const isHost = useStore((s) => s.isHost);
   const locked = useStore((s) => s.locked);
   const editable = isHost || !locked;
@@ -46,6 +47,14 @@ export default function QueuePanel() {
               </span>
               {editable && (
                 <span className="flex flex-shrink-0 gap-0.5">
+                  <button
+                    className={`${actionBtn} hover:text-accent`}
+                    title="Play now"
+                    aria-label={`Play ${item.title || item.source} now`}
+                    onClick={() => client.queuePlay(idx)}
+                  >
+                    ▶
+                  </button>
                   {idx > 0 && (
                     <button className={actionBtn} title="Move up" onClick={() => client.queueMove(idx, idx - 1)}>
                       ↑
@@ -76,12 +85,21 @@ export default function QueuePanel() {
         </p>
       )}
 
-      <button
-        onClick={() => client.queueSkip()}
-        className="mt-2 w-full rounded-lg border border-border bg-transparent px-5 py-2.5 transition hover:bg-surface2"
-      >
-        Skip to next
-      </button>
+      {/* With nothing queued, a skip ends the current video for everyone —
+          say so rather than calling it "Skip to next"; with nothing playing it
+          starts the queue. Hidden from viewers the host has locked out, whose
+          skips the server ignores anyway. */}
+      {editable && (hasMedia || queue.length > 0) && (
+        <button
+          onClick={() => {
+            if (queue.length === 0 && !window.confirm('Stop the video for everyone?')) return;
+            client.queueSkip();
+          }}
+          className="mt-2 w-full rounded-lg border border-border bg-transparent px-5 py-2.5 transition hover:bg-surface2"
+        >
+          {queue.length === 0 ? 'Stop video' : hasMedia ? 'Skip to next' : 'Start the queue'}
+        </button>
+      )}
     </div>
   );
 }

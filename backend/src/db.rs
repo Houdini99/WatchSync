@@ -214,17 +214,12 @@ pub async fn owner_rooms(pool: &SqlitePool, owner_id: i64) -> sqlx::Result<Vec<R
         .collect())
 }
 
-pub async fn owner_room_count(pool: &SqlitePool, owner_id: i64) -> sqlx::Result<i64> {
-    let row = sqlx::query("SELECT COUNT(*) AS n FROM registered_rooms WHERE owner_id = ?1")
-        .bind(owner_id)
-        .fetch_one(pool)
-        .await?;
-    Ok(row.get("n"))
-}
 
 pub enum ClaimOutcome {
     Claimed,
     Taken,
+    /// The owner already holds `max_rooms_per_user` slugs.
+    AtLimit,
 }
 
 pub async fn claim_slug(
@@ -232,14 +227,28 @@ pub async fn claim_slug(
     slug: &str,
     owner_id: i64,
     now: i64,
+    max_per_owner: i64,
 ) -> sqlx::Result<ClaimOutcome> {
-    let res = sqlx::query("INSERT INTO registered_rooms (slug, owner_id, created_at) VALUES (?1, ?2, ?3)")
-        .bind(slug)
-        .bind(owner_id)
-        .bind(now)
-        .execute(pool)
-        .await;
+    // The per-owner cap is enforced HERE, inside the insert, not by a separate
+    // count beforehand. The caller's check-then-act let two concurrent POSTs
+    // from one session both read n = max - 1 and both insert; the slug primary
+    // key stops duplicate SLUGS but says nothing about how many one owner
+    // holds. `INSERT … SELECT … WHERE (SELECT COUNT(*) …) < ?` makes the count
+    // and the insert a single atomic statement.
+    let res = sqlx::query(
+        "INSERT INTO registered_rooms (slug, owner_id, created_at)
+         SELECT ?1, ?2, ?3
+         WHERE (SELECT COUNT(*) FROM registered_rooms WHERE owner_id = ?2) < ?4",
+    )
+    .bind(slug)
+    .bind(owner_id)
+    .bind(now)
+    .bind(max_per_owner)
+    .execute(pool)
+    .await;
     match res {
+        // Zero rows means the WHERE guard failed, i.e. the owner is at the cap.
+        Ok(r) if r.rows_affected() == 0 => Ok(ClaimOutcome::AtLimit),
         Ok(_) => Ok(ClaimOutcome::Claimed),
         Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Ok(ClaimOutcome::Taken),
         Err(e) => Err(e),
